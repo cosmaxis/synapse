@@ -3879,6 +3879,7 @@ mod tests {
         fs::write(
             &fake_git,
             "#!/bin/sh\n\
+             printf 'git %s\\n' \"$*\" >> \"$SYNAPSE_TEST_GIT_LOG\"\n\
              if [ \"$3\" = remote ] && [ \"$4\" = get-url ]; then\n\
                printf '%s\\n' \"$SYNAPSE_TEST_REMOTE\"\n\
                exit 0\n\
@@ -3900,6 +3901,8 @@ mod tests {
         let _skillshare = EnvGuard::set("SYNAPSE_SKILLSHARE_BIN", &fake_skillshare);
         let _git = EnvGuard::set("SYNAPSE_GIT_BIN", &fake_git);
         let _log = EnvGuard::set("SYNAPSE_TEST_LOG", &log);
+        let git_log = temp.join("git.log");
+        let _git_log = EnvGuard::set("SYNAPSE_TEST_GIT_LOG", &git_log);
         let _remote = EnvGuard::set("SYNAPSE_TEST_REMOTE", Path::new(remote));
         let manifest = StackManifest {
             version: STACK_VERSION,
@@ -3926,6 +3929,19 @@ mod tests {
             )
         );
 
+        // `skillshare init --remote` does not clone; ensure must fetch the
+        // remote default branch itself or the stack never arrives.
+        let git_log = fs::read_to_string(&git_log).unwrap();
+        for expected in [
+            "fetch origin",
+            "ls-remote --symref origin HEAD",
+            "reset --hard origin/main",
+        ] {
+            assert!(
+                git_log.contains(expected),
+                "missing git {expected} in:\n{git_log}"
+            );
+        }
         fs::remove_dir_all(temp).ok();
     }
 }
