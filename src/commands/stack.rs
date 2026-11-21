@@ -180,15 +180,19 @@ fn restore_inner(
     } else {
         None
     };
-    restore_from(&input, &manifest, force)?;
-    if let Some(secret_values) = secret_values {
-        let local = install_secret_environment(&secret_values)?;
+    // Secrets and shell config land BEFORE the stack is rewritten: if either
+    // fails, nothing has changed yet and the error is actionable instead of
+    // leaving a restored stack whose credentials never arrived.
+    if let Some(values) = &secret_values {
+        let local = install_secret_environment(values)?;
         println!(
             "Restored {} encrypted environment value(s) to {}; restart your shell to load them.",
-            secret_values.len(),
+            values.len(),
             local.display()
         );
-    } else if input.join(secrets::STACK_SECRETS_FILE).is_file() {
+    }
+    restore_from(&input, &manifest, force)?;
+    if secret_values.is_none() && input.join(secrets::STACK_SECRETS_FILE).is_file() {
         println!("Encrypted secrets are available; rerun with --with-secrets to restore them.");
     }
     println!("Restored AI stack from {}", input.display());
@@ -2097,17 +2101,59 @@ fn resolve_secret_command(value: &str) -> io::Result<String> {
         ));
     }
     let command = value.trim_start_matches('!').trim_start();
-    let output = Command::new("sh")
+    // OMP resolves these with a bounded wait; mirror that so a resolver that
+    // blocks (e.g. `cat` on a FIFO) cannot hang capture forever.
+    const RESOLVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const MAX_RESOLVER_OUTPUT: u64 = 1024 * 1024;
+    let mut child = Command::new("sh")
         .arg("-c")
         .arg(command)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .map_err(|error| io::Error::new(error.kind(), "failed to resolve MCP secret command"))?;
-    if !output.status.success() {
+    // Drain stdout on a thread so a large-but-finite output cannot deadlock on
+    // a full pipe; the cap stops the read so the writer dies on EPIPE instead
+    // of exhausting memory.
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut limited = std::io::Read::take(&mut stdout, MAX_RESOLVER_OUTPUT);
+        let _ = std::io::Read::read_to_end(&mut limited, &mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + RESOLVER_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "MCP secret command timed out after 10s",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => {
+                break Err(io::Error::new(
+                    error.kind(),
+                    "failed to wait for MCP secret command",
+                ))
+            }
+        }
+    };
+    let buf = reader.join().unwrap_or_default();
+    let status = status?;
+    if !status.success() {
         return Err(invalid_data(
             "MCP secret command failed while capturing encrypted secrets",
         ));
     }
-    let value = String::from_utf8(output.stdout)
+    let value = String::from_utf8(buf)
         .map_err(|_| invalid_data("MCP secret command returned non-UTF-8 output"))?;
     Ok(value.trim_end_matches(['\r', '\n']).to_string())
 }
@@ -2137,8 +2183,11 @@ fn sanitize_env(
             })?
             .to_string();
         if current.starts_with('!') && secret_values.is_some() {
-            let variable = name.clone();
+            // Resolved command output is a server-scoped secret: namespace it
+            // like headers/auth so it cannot collide with a real env var of
+            // the same name on another server or in the user's shell.
             let resolved = resolve_secret_command(&current)?;
+            let variable = generated_variable(server_name, &["env", name]);
             record_secret_value(secret_values.as_deref_mut().unwrap(), &variable, resolved)?;
             *value = Value::String(variable.clone());
             required_env.insert(variable);
@@ -2150,15 +2199,34 @@ fn sanitize_env(
             }
             continue;
         }
+        // Already-portable manifests carry our own generated name back as the
+        // value. Treat it as an env reference so validation and recapture stay
+        // idempotent instead of storing the variable name as the secret.
+        let namespaced = generated_variable(server_name, &["env", name]);
+        if current == namespaced {
+            record_environment_value(&namespaced, required_env, secret_values.as_deref_mut())?;
+            continue;
+        }
         if current == *name {
             record_environment_value(name, required_env, secret_values.as_deref_mut())?;
             continue;
         }
 
-        let variable = name.clone();
-        record_secret_value_if_requested(secret_values.as_deref_mut(), &variable, current)?;
-        *value = Value::String(variable.clone());
-        required_env.insert(variable);
+        if let Some(secret_values) = secret_values.as_deref_mut() {
+            // Literal env values are server-scoped, not global: a server's
+            // PATH=/custom must not become `export PATH=...` in every shell,
+            // and two servers using the same env name must not share one
+            // snapshot slot. Namespace per server, matching headers/auth.
+            let variable = generated_variable(server_name, &["env", name]);
+            record_secret_value(secret_values, &variable, current)?;
+            *value = Value::String(variable.clone());
+            required_env.insert(variable);
+        } else {
+            // Without --with-secrets the literal cannot travel; keep the
+            // self-name reference so the value comes from the real env var.
+            *value = Value::String(name.clone());
+            required_env.insert(name.clone());
+        }
     }
     Ok(())
 }
@@ -2538,7 +2606,13 @@ fn reject_secret_value(server_name: &str, path: &mut Vec<String>, value: &Value)
                         .get(path.len().saturating_sub(2))
                         .map(String::as_str)
                         .unwrap_or_default();
-                    let env_reference = parent == "env" && text == name && valid_env_name(text);
+                    // Env values may reference the real variable (self-name)
+                    // or the server-scoped generated name secrets capture
+                    // writes; anything else literal is rejected.
+                    let env_reference = parent == "env"
+                        && valid_env_name(text)
+                        && (text == name
+                            || text == generated_variable(server_name, &["env", name]));
                     let authorization =
                         parent == "headers" && name.eq_ignore_ascii_case("Authorization");
                     if !env_reference
@@ -2841,7 +2915,11 @@ mod tests {
         assert!(!encoded.contains("auth-secret"));
         assert_eq!(
             portable["mcpServers"]["service"]["env"]["FROM_COMMAND"],
-            "FROM_COMMAND"
+            "SYNAPSE_MCP_SERVICE_ENV_FROM_COMMAND"
+        );
+        assert_eq!(
+            portable["mcpServers"]["service"]["env"]["PASSWORD"],
+            "SYNAPSE_MCP_SERVICE_ENV_PASSWORD"
         );
         assert_eq!(
             portable["mcpServers"]["service"]["headers"]["Authorization"],
@@ -2850,8 +2928,14 @@ mod tests {
         assert_eq!(
             values,
             BTreeMap::from([
-                ("FROM_COMMAND".to_string(), "command-secret".to_string()),
-                ("PASSWORD".to_string(), "literal-password".to_string()),
+                (
+                    "SYNAPSE_MCP_SERVICE_ENV_FROM_COMMAND".to_string(),
+                    "command-secret".to_string(),
+                ),
+                (
+                    "SYNAPSE_MCP_SERVICE_ENV_PASSWORD".to_string(),
+                    "literal-password".to_string(),
+                ),
                 (
                     "SYNAPSE_STACK_TEST_EXTERNAL".to_string(),
                     "external-secret".to_string(),
@@ -3263,7 +3347,10 @@ mod tests {
         let ciphertext = fs::read(output.join(secrets::STACK_SECRETS_FILE)).unwrap();
 
         assert_eq!(count, 1);
-        assert_eq!(manifest.omp_profiles[0].required_env, vec!["SERVICE_TOKEN"]);
+        assert_eq!(
+            manifest.omp_profiles[0].required_env,
+            vec!["SYNAPSE_MCP_SERVICE_ENV_SERVICE_TOKEN"]
+        );
         assert!(!ciphertext
             .windows(b"literal-secret".len())
             .any(|window| window == b"literal-secret"));
@@ -3273,7 +3360,10 @@ mod tests {
                 age::secrecy::SecretString::from("test passphrase".to_string()),
             )
             .unwrap(),
-            BTreeMap::from([("SERVICE_TOKEN".to_string(), "literal-secret".to_string())])
+            BTreeMap::from([(
+                "SYNAPSE_MCP_SERVICE_ENV_SERVICE_TOKEN".to_string(),
+                "literal-secret".to_string(),
+            )])
         );
 
         fs::remove_dir_all(temp).ok();
@@ -3296,6 +3386,9 @@ mod tests {
         let missing_skillshare = temp.join("missing-skillshare.yaml");
         const SECRET: &str = "synthetic e2e credential 'with quote'";
         const ENV_NAME: &str = "SYNAPSE_STACK_E2E_TOKEN";
+        // Env literals are server-scoped: the portable value and the
+        // secrets.env export use this generated name, not ENV_NAME.
+        const ENV_VAR: &str = "SYNAPSE_MCP_SYNTHETIC_ENV_SYNAPSE_STACK_E2E_TOKEN";
 
         fs::create_dir_all(source_omp.join("agent")).unwrap();
         fs::write(
@@ -3331,7 +3424,7 @@ mod tests {
             age::secrecy::SecretString::from("test passphrase".to_string()),
         )
         .unwrap();
-        assert_eq!(values[ENV_NAME], SECRET);
+        assert_eq!(values[ENV_VAR], SECRET);
 
         fs::create_dir_all(&target_home).unwrap();
         fs::write(target_home.join(".bashrc"), "# target shell\n").unwrap();
@@ -3350,14 +3443,14 @@ mod tests {
             read_json_optional(&target_omp.join("agent/mcp.json"))
                 .unwrap()
                 .unwrap()["mcpServers"]["synthetic"]["env"][ENV_NAME],
-            ENV_NAME
+            ENV_VAR
         );
         let output = Command::new("bash")
             .args([
                 "--noprofile",
                 "--norc",
                 "-c",
-                ". \"$1\"; printf '%s' \"$SYNAPSE_STACK_E2E_TOKEN\"",
+                ". \"$1\"; printf '%s' \"$SYNAPSE_MCP_SYNTHETIC_ENV_SYNAPSE_STACK_E2E_TOKEN\"",
                 "bash",
                 target_home.join(".bashrc").to_str().unwrap(),
             ])

@@ -108,14 +108,14 @@ impl Shell {
             ),
             Shell::Fish => concat!(
                 "# Synapse encrypted secrets\n",
+                "set -g synapse_secrets \"$HOME/.config/synapse/secrets.env\"\n",
                 "if set -q XDG_CONFIG_HOME; and test -n \"$XDG_CONFIG_HOME\"\n",
-                "    set -l synapse_secrets \"$XDG_CONFIG_HOME/synapse/secrets.env\"\n",
-                "else\n",
-                "    set -l synapse_secrets \"$HOME/.config/synapse/secrets.env\"\n",
+                "    set -g synapse_secrets \"$XDG_CONFIG_HOME/synapse/secrets.env\"\n",
                 "end\n",
                 "if test -r \"$synapse_secrets\"\n",
                 "    source \"$synapse_secrets\"\n",
                 "end\n",
+                "set -eg synapse_secrets\n",
             ),
         }
     }

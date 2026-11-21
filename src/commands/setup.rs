@@ -51,6 +51,7 @@ pub fn run(dry_run: bool) -> io::Result<()> {
     }
 
     let mut touched: Vec<PathBuf> = Vec::new();
+    let mut rc_failures: Vec<String> = Vec::new();
 
     for sh in &shells_found {
         // Completions first: the rc line we write must point at a real file.
@@ -76,10 +77,13 @@ pub fn run(dry_run: bool) -> io::Result<()> {
             Ok(RcOutcome::Unchanged) => {
                 println!("  {} → already configured", sh.name());
             }
-            Err(e) => eprintln!(
-                "  warning: could not update {}: {e}",
-                sh.rc_path(&home).display()
-            ),
+            Err(e) => {
+                eprintln!(
+                    "  warning: could not update {}: {e}",
+                    sh.rc_path(&home).display()
+                );
+                rc_failures.push(format!("{}: {e}", sh.rc_path(&home).display()));
+            }
         }
     }
 
@@ -99,6 +103,15 @@ pub fn run(dry_run: bool) -> io::Result<()> {
 
     print!("\n{}", shell::next_steps(&installed, &touched, current));
 
+    // A failed rc write means PATH and the secrets snippet never landed, so
+    // callers like `stack restore --with-secrets` must not report success.
+    // The summary above already printed; the error names what to fix.
+    if !rc_failures.is_empty() {
+        return Err(io::Error::other(format!(
+            "could not update shell config: {}",
+            rc_failures.join("; ")
+        )));
+    }
     Ok(())
 }
 
