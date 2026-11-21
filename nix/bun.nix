@@ -10,24 +10,24 @@
   stdenvNoCC,
 }:
 let
-  version = "1.4.2";
+  version = "1.4.4";
 
   sources = {
     "x86_64-linux" = {
       asset = "bun-linux-x64-baseline.zip";
-      hash = "sha256-xngEDxT+BEDrg503y9DOTAUaMtpygGrJfeamqra/co8=";
+      hash = "sha256-4ERutVmVdy65iUvrrppr42jZhai5Jx7hJEhvmUbu3XY=";
     };
     "aarch64-linux" = {
       asset = "bun-linux-aarch64.zip";
-      hash = "sha256-VDKLvC2cjgyfiSxUTWbFeoO4QTnjSQnl7oF1jxrI/ac=";
+      hash = "sha256-uqa7NvUdblhWHgK76oJQOKnfRU9nPW13bou/hvjHhQ4=";
     };
     "x86_64-darwin" = {
       asset = "bun-darwin-x64.zip";
-      hash = "sha256-gFINfhdSYwjJGF0mFnmsbSd5jTgDoOn3/5Ehq4r/sBI=";
+      hash = "sha256-UKNJH3Orwv6BZzFxqFdi07wswWgMzsrdmD3pmt93l34=";
     };
     "aarch64-darwin" = {
       asset = "bun-darwin-aarch64.zip";
-      hash = "sha256-kJh6OhbX21VtiGrD1VHnttPt8KHPQ6yu1iLoZ2vh0S8=";
+      hash = "sha256-wkDX8My5DCY6hJ/NsJt+5iYw2SE0jtaq/ahrnVd7xRA=";
     };
   };
 
