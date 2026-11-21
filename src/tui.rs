@@ -326,9 +326,13 @@ type InstallResult = Result<(String, Option<String>, bool), String>;
 ///
 /// Returns the installed version, store path, and whether a prior profile element
 /// was replaced.
-fn install_package(pkg: &Package, flake_dir: &std::path::Path, nix_bin: &str) -> InstallResult {
+fn install_package(
+    pkg: &Package,
+    flake_dir: &std::path::Path,
+    nix_bin: &str,
+    prior_store_path: Option<&str>,
+) -> InstallResult {
     let attr = crate::commands::update::flake_attr(flake_dir, pkg.nix_attr);
-
     let version_attr =
         crate::commands::update::flake_attr(flake_dir, &format!("{}.version", pkg.nix_attr));
     // Read version from the same local or remote flake.
@@ -341,6 +345,7 @@ fn install_package(pkg: &Package, flake_dir: &std::path::Path, nix_bin: &str) ->
             "--raw",
             &version_attr,
             "--no-write-lock-file",
+            "--refresh",
         ])
         .current_dir(flake_dir)
         .output()
@@ -356,8 +361,13 @@ fn install_package(pkg: &Package, flake_dir: &std::path::Path, nix_bin: &str) ->
     if version.is_empty() {
         return Err("nix eval returned an empty package version".to_string());
     }
-    let had_previous =
-        crate::commands::update::replace_profile_package(nix_bin, pkg.name, &attr, flake_dir)?;
+    let had_previous = crate::commands::update::replace_profile_package(
+        nix_bin,
+        pkg.name,
+        &attr,
+        flake_dir,
+        prior_store_path,
+    )?;
 
     let store_path = crate::commands::update::store_path_of(pkg.nix_attr, flake_dir, nix_bin);
     Ok((version, store_path, had_previous))
@@ -372,11 +382,17 @@ fn spawn_install(
     pkg: &'static Package,
     flake_dir: std::path::PathBuf,
     nix_bin: String,
+    prior_store_path: Option<String>,
 ) -> Receiver<InstallResult> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         // Send failure is fine: it only means the TUI stopped listening.
-        let _ = tx.send(install_package(pkg, &flake_dir, &nix_bin));
+        let _ = tx.send(install_package(
+            pkg,
+            &flake_dir,
+            &nix_bin,
+            prior_store_path.as_deref(),
+        ));
     });
     rx
 }
@@ -388,12 +404,19 @@ pub fn doctor_check(binaries: &[&str]) -> Vec<(String, bool)> {
     binaries
         .iter()
         .map(|bin| {
-            let ok = Command::new("which")
+            // Prefer the Synapse profile: `which` only sees PATH, which does
+            // not include the profile until setup-shell has run.
+            let in_profile = crate::commands::update::synapse_profile()
+                .map(|profile| {
+                    crate::commands::update::is_executable(&profile.join("bin").join(bin))
+                })
+                .unwrap_or(false);
+            let on_path = Command::new("which")
                 .arg(bin)
                 .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false);
-            (bin.to_string(), ok)
+            (bin.to_string(), in_profile || on_path)
         })
         .collect()
 }
@@ -563,6 +586,19 @@ fn run_installs(
         }
     };
 
+    // Snapshot each package's current store path before any profile mutation:
+    // undo needs the exact prior closure, not a generation guess.
+    let prior_paths: std::collections::HashMap<String, String> = state::read(&cfg_dir)
+        .map(|st| {
+            st.packages
+                .iter()
+                .filter_map(|(name, record)| {
+                    record.store_path.clone().map(|path| (name.clone(), path))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let tick = Duration::from_millis(200);
     let mut failures = Vec::new();
 
@@ -575,13 +611,24 @@ fn run_installs(
             started: Instant::now(),
         };
 
-        let rx = spawn_install(pkg, flake_dir.to_path_buf(), nix_bin.to_string());
+        let rx = spawn_install(
+            pkg,
+            flake_dir.to_path_buf(),
+            nix_bin.to_string(),
+            prior_paths.get(pkg.name).cloned(),
+        );
 
         // Poll for completion while continuing to render.
         // Profile replacement is transactional but not cancellable. Wait for the
         // worker rather than reporting an abort while Nix is still mutating it.
+        // A failed draw must not abandon the worker: the lock releases on
+        // early return while Nix may still be mutating the profile. Record the
+        // failure and keep draining rx until the install reports back.
+        let mut draw_failed = false;
         let result = loop {
-            terminal.draw(|f| draw(f, app))?;
+            if !draw_failed && terminal.draw(|f| draw(f, app)).is_err() {
+                draw_failed = true;
+            }
             match rx.try_recv() {
                 Ok(result) => break result,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -601,7 +648,9 @@ fn run_installs(
                     let rollback = crate::commands::update::undo_profile_replace(
                         nix_bin,
                         pkg.name,
+                        prior_paths.get(pkg.name).map(String::as_str),
                         had_previous,
+                        flake_dir,
                     )
                     .err();
                     let message = match rollback {
@@ -642,7 +691,18 @@ fn run_installs(
         .filter(|(i, _)| app.selected[*i] && matches!(app.install_status[*i], InstallStatus::Done))
         .map(|(_, p)| p.name)
         .collect();
-    let _ = doctor_check(&bins);
+    let missing: Vec<String> = doctor_check(&bins)
+        .into_iter()
+        .filter(|(_, ok)| !ok)
+        .map(|(bin, _)| bin)
+        .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "warning: installed binaries not found on PATH: {}",
+            missing.join(", ")
+        );
+        eprintln!("  run `synapse setup-shell` to add the Synapse profile to your shell");
+    }
     if failures.is_empty() {
         Ok(())
     } else {

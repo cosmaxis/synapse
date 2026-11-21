@@ -8,60 +8,91 @@ use crate::state;
 /// remain available through older profile generations until garbage collection.
 pub fn run(package: Option<&str>, all: bool) -> io::Result<()> {
     let cfg = state::config_dir();
+    // Lock before reading state so target selection and the per-package
+    // state::write observe one consistent snapshot.
+    let _lock = state::acquire(&cfg).map_err(|e| io::Error::other(e.to_string()))?;
     let mut st = state::read(&cfg)?;
 
-    if st.packages.is_empty() {
-        println!("No packages installed.");
-        return Ok(());
-    }
-
-    let targets: Vec<String> = match package {
-        Some(name) if !all => {
+    let targets: Vec<String> = match (package, all) {
+        (Some(name), false) => {
             if !st.packages.contains_key(name) {
                 eprintln!("error: '{name}' is not installed");
                 std::process::exit(1);
             }
             vec![name.to_string()]
         }
-        _ => {
+        // `--all` with an empty state still reaches shell cleanup below, so a
+        // previous run that removed packages but failed cleanup can be retried.
+        (None, true) => {
             let mut keys: Vec<_> = st.packages.keys().cloned().collect();
             keys.sort();
             keys
         }
-    };
-
-    let _lock = state::acquire(&cfg).map_err(|e| io::Error::other(e.to_string()))?;
-    let nix_bin = crate::nix::resolve_bin()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "nix not found"))?;
-    let mut failures = Vec::new();
-
-    for name in &targets {
-        let version = st
-            .packages
-            .get(name)
-            .map(|r| r.version.clone())
-            .unwrap_or_default();
-        if let Err(error) = crate::commands::update::remove_profile_package(&nix_bin, name) {
-            eprintln!("warning: could not remove {name} from the Nix profile: {error}");
-            failures.push(format!("{name}: {error}"));
-            continue;
-        }
-        st.remove_package(name);
-        if let Err(error) = state::write(&cfg, &st) {
-            let rollback = crate::commands::update::undo_profile_remove(&nix_bin, name).err();
+        (Some(_), true) => {
             return Err(io::Error::new(
-                error.kind(),
-                match rollback {
-                    Some(rollback) => {
-                        format!("write state: {error}; profile rollback: {rollback}")
-                    }
-                    None => format!("write state: {error}"),
-                },
+                io::ErrorKind::InvalidInput,
+                "--all cannot be combined with a package name",
             ));
         }
-        println!("  {name} {version} removed from the Synapse profile");
-        let _ =
-            crate::commands::log::append(&format!("{} uninstalled {name} {version}", now_secs()));
+        // Bare `uninstall` must not implicitly mean --all: the CLI contract
+        // requires --all for everything, and silently removing every managed
+        // package is a footgun.
+        (None, false) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "nothing to uninstall: pass a package name or --all",
+            ));
+        }
+    };
+
+    let mut failures = Vec::new();
+    if !targets.is_empty() {
+        let nix_bin = crate::nix::resolve_bin()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "nix not found"))?;
+        let flake_dir = crate::commands::update::locate_flake_dir();
+
+        for name in &targets {
+            let version = st
+                .packages
+                .get(name)
+                .map(|r| r.version.clone())
+                .unwrap_or_default();
+            // The removed element's store path lets a failed state write
+            // reinstall the exact closure rather than guessing generations.
+            let prior_store_path = st
+                .packages
+                .get(name)
+                .and_then(|record| record.store_path.clone());
+            if let Err(error) = crate::commands::update::remove_profile_package(&nix_bin, name) {
+                eprintln!("warning: could not remove {name} from the Nix profile: {error}");
+                failures.push(format!("{name}: {error}"));
+                continue;
+            }
+            st.remove_package(name);
+            if let Err(error) = state::write(&cfg, &st) {
+                let rollback = crate::commands::update::undo_profile_remove(
+                    &nix_bin,
+                    name,
+                    prior_store_path.as_deref(),
+                    &flake_dir,
+                )
+                .err();
+                return Err(io::Error::new(
+                    error.kind(),
+                    match rollback {
+                        Some(rollback) => {
+                            format!("write state: {error}; profile rollback: {rollback}")
+                        }
+                        None => format!("write state: {error}"),
+                    },
+                ));
+            }
+            println!("  {name} {version} removed from the Synapse profile");
+            let _ = crate::commands::log::append(&format!(
+                "{} uninstalled {name} {version}",
+                now_secs()
+            ));
+        }
     }
 
     // Only strip shell config once nothing is managed; otherwise the remaining
@@ -120,10 +151,20 @@ fn remove_shell_config() -> io::Result<Vec<std::path::PathBuf>> {
             continue;
         }
 
-        // Atomic replace, same discipline as writing the block.
-        let tmp = rc.with_extension("synapse-tmp");
+        // Write through to the resolved target: `read_to_string` follows a
+        // symlinked rc, so renaming over `rc` itself would replace the link
+        // with a regular file and leave the managed block in the dotfile
+        // target. Canonicalizing keeps dotfile-manager setups intact.
+        let target = std::fs::canonicalize(&rc).unwrap_or_else(|_| rc.clone());
+        let tmp = target.with_extension("synapse-tmp");
         std::fs::write(&tmp, stripped.as_bytes())?;
-        std::fs::rename(&tmp, &rc)?;
+        // Preserve the rc file's own permissions — a plain write+rename would
+        // widen a private 0600 file to the umask default.
+        #[cfg(unix)]
+        if let Ok(metadata) = std::fs::metadata(&target) {
+            let _ = std::fs::set_permissions(&tmp, metadata.permissions());
+        }
+        std::fs::rename(&tmp, &target)?;
         removed.push(rc);
     }
 
