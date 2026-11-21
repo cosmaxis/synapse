@@ -259,18 +259,24 @@ pub fn write(dir: &Path, state: &State) -> io::Result<()> {
 
 // ── Lock file ─────────────────────────────────────────────────────────────────
 
-/// An exclusive process lock held on `<dir>/.lock`.
+/// An exclusive advisory lock held on `<dir>/.lock`.
+///
+/// The lock is an OS-level `flock` on a stable inode: the file is created
+/// once and NEVER unlinked, so there is no check-then-act window — a
+/// contender either wins the kernel lock or gets `EWOULDBLOCK`. The kernel
+/// releases the lock automatically if the process dies, which also removes
+/// the stale-lock and PID-reuse problems a PID file cannot solve. The PID
+/// written inside is diagnostics only; exclusion never depends on it.
 ///
 /// Dropped via [`Drop`]; `release` can also be called explicitly.
 pub struct Lock {
-    path: PathBuf,
+    file: std::fs::File,
     released: bool,
 }
 
 impl std::fmt::Debug for Lock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Lock")
-            .field("path", &self.path)
             .field("released", &self.released)
             .finish()
     }
@@ -279,7 +285,7 @@ impl std::fmt::Debug for Lock {
 /// Errors that can occur while acquiring the lock.
 #[derive(Debug)]
 pub enum LockError {
-    /// Another live process owns the lock.
+    /// Another process holds the lock.
     Held { owner_pid: u32 },
     /// I/O failure unrelated to contention.
     Io(io::Error),
@@ -302,52 +308,93 @@ impl std::fmt::Display for LockError {
 
 /// Try to acquire the lock at `<dir>/.lock`.
 ///
-/// - If no lock file exists, write our PID and succeed.
-/// - If a lock file exists and the PID inside is still running, return
-///   [`LockError::Held`].
-/// - If the PID is gone (stale lock), replace it with our PID and succeed.
-/// - If another process wins the create race, return [`LockError::Held`] naming
-///   that process — contention is never reported as an I/O failure.
+/// `create(true)` without `create_new` is deliberate: every contender opens
+/// the SAME inode, and `flock` arbitrates. Unlinking the file (the old
+/// PID-file scheme's stale cleanup) would let a contender lock an inode the
+/// winner already replaced — the TOCTOU this design removes.
 pub fn acquire(dir: &Path) -> Result<Lock, LockError> {
     fs::create_dir_all(dir).map_err(LockError::Io)?;
     let path = dir.join(".lock");
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(LockError::Io)?;
 
-    if path.exists() {
-        let raw = fs::read_to_string(&path).map_err(LockError::Io)?;
-        if let Ok(pid) = raw.trim().parse::<u32>() {
-            if is_running(pid) {
-                return Err(LockError::Held { owner_pid: pid });
-            }
-            // Stale lock: remove it so create_new below succeeds.
-            fs::remove_file(&path).map_err(LockError::Io)?;
-        }
+    flock_exclusive(&file, &path)?;
+
+    // Record our PID for diagnostics only — a stale or empty file never
+    // affects exclusion because the flock, not the contents, is the lock.
+    let _ = file.set_len(0);
+    let _ = file.write_all(std::process::id().to_string().as_bytes());
+    let _ = file.sync_all();
+
+    Ok(Lock {
+        file,
+        released: false,
+    })
+}
+
+/// `flock(LOCK_EX|LOCK_NB)` on an already-open file.
+#[cfg(unix)]
+fn flock_exclusive(file: &fs::File, path: &Path) -> Result<(), LockError> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: flock on a valid open fd; LOCK_NB makes it non-blocking.
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret == 0 {
+        return Ok(());
     }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        return Err(LockError::Held {
+            owner_pid: lock_owner_pid(path),
+        });
+    }
+    Err(LockError::Io(error))
+}
 
-    match write_pid(&path) {
-        Ok(()) => Ok(Lock {
-            path,
-            released: false,
-        }),
-        // Lost the create_new race: the winner's PID is now in the file. Report
-        // contention, not an I/O error, so callers can show the friendly path.
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            let owner_pid = fs::read_to_string(&path)
-                .ok()
-                .and_then(|raw| raw.trim().parse::<u32>().ok())
-                .unwrap_or(0);
-            Err(LockError::Held { owner_pid })
-        }
-        Err(e) => Err(LockError::Io(e)),
+/// Non-Unix targets have no flock; the file is still created so callers see a
+/// consistent layout, but exclusion is advisory-only there. The crate is
+/// unix-only in practice (secrets.rs imports std::os::unix unconditionally).
+#[cfg(not(unix))]
+fn flock_exclusive(_file: &fs::File, _path: &Path) -> Result<(), LockError> {
+    Ok(())
+}
+
+/// Best-effort PID read for the `Held` diagnostic — never authoritative.
+fn lock_owner_pid(path: &Path) -> u32 {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// `flock(LOCK_UN)` — closing the fd would also release, but explicit unlock
+/// lets `release()` free the lock while the file stays open.
+#[cfg(unix)]
+fn flock_unlock(file: &fs::File) {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: flock on a valid open fd.
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
     }
 }
 
+#[cfg(not(unix))]
+fn flock_unlock(_file: &fs::File) {}
+
 impl Lock {
-    /// Explicitly release the lock. Idempotent.
+    /// Explicitly release the lock. Idempotent. The `.lock` file itself stays:
+    /// it is a stable inode, and unlinking it is exactly what would reopen the
+    /// race this design closes.
     pub fn release(&mut self) {
-        if !self.released {
-            let _ = fs::remove_file(&self.path);
-            self.released = true;
+        if self.released {
+            return;
         }
+        self.released = true;
+        flock_unlock(&self.file);
     }
 }
 
@@ -355,40 +402,6 @@ impl Drop for Lock {
     fn drop(&mut self) {
         self.release();
     }
-}
-
-fn write_pid(path: &Path) -> io::Result<()> {
-    use std::fs::OpenOptions;
-    let pid = std::process::id();
-    // O_CREAT|O_EXCL: atomic at the OS level — exactly one concurrent caller wins.
-    // If the file already exists this returns ErrorKind::AlreadyExists, which
-    // acquire() interprets as contention and re-reads the owning PID.
-    let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
-    write!(f, "{pid}")
-}
-
-/// Returns true if a process with `pid` is currently running.
-///
-/// On Unix: `kill(pid, 0)` — sends no signal but checks existence.
-/// Interprets EPERM (process exists but we can't signal it) as running.
-#[cfg(unix)]
-fn is_running(pid: u32) -> bool {
-    // SAFETY: kill(pid, 0) sends no signal; we only test whether the process
-    // exists. Any return value other than -1 means it's running; -1/EPERM also
-    // means it's running (we lack permission to signal it).
-    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if ret == 0 {
-        return true;
-    }
-    // EPERM: process exists but we can't signal it — still running.
-    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// On non-Unix targets, we conservatively assume the process is running to
-/// avoid spuriously clearing a lock we can't verify.
-#[cfg(not(unix))]
-fn is_running(_pid: u32) -> bool {
-    true
 }
 
 #[cfg(test)]
@@ -577,9 +590,14 @@ mod tests {
     fn lock_acquire_and_release() {
         let d = tmpdir();
         let mut lock = acquire(d.path()).expect("should acquire fresh lock");
+        // The inode is stable: the file persists after release by design.
         assert!(d.path().join(".lock").exists());
         lock.release();
-        assert!(!d.path().join(".lock").exists());
+        assert!(d.path().join(".lock").exists());
+        // Re-acquiring proves the flock was actually released.
+        acquire(d.path())
+            .expect("re-acquire after release")
+            .release();
     }
 
     #[test]
@@ -589,73 +607,40 @@ mod tests {
             let _lock = acquire(d.path()).expect("should acquire");
             assert!(d.path().join(".lock").exists());
         }
-        assert!(
-            !d.path().join(".lock").exists(),
-            "lock not released on drop"
-        );
+        // Drop closed the fd, so the kernel released the flock: a fresh
+        // acquire must succeed even though .lock still exists on disk.
+        acquire(d.path()).expect("re-acquire after drop").release();
     }
 
     #[test]
     fn lock_rejects_live_owner() {
         let d = tmpdir();
-        // Write our own PID — we are definitely running.
-        let lock_path = d.path().join(".lock");
-        fs::write(&lock_path, std::process::id().to_string()).unwrap();
+        // A second acquire while the first is held must report contention,
+        // naming the PID the holder wrote for diagnostics.
+        let _lock = acquire(d.path()).expect("first acquire");
         match acquire(d.path()) {
             Err(LockError::Held { owner_pid }) => {
                 assert_eq!(owner_pid, std::process::id());
             }
             other => panic!("expected Held, got {other:?}"),
         }
-        // Clean up so the test's temp dir drops cleanly.
-        fs::remove_file(&lock_path).unwrap();
     }
 
     #[test]
-    fn lock_clears_stale_pid() {
+    fn stale_pid_file_does_not_block() {
         let d = tmpdir();
-        // PID 1 on Linux is init and unlikely to be re-assignable to us, but
-        // we need a PID that is definitely *not* our process. Use 99999 which
-        // is above the typical max PID on macOS (99998) so kill(99999, 0)
-        // returns ESRCH.
-        let lock_path = d.path().join(".lock");
-        fs::write(&lock_path, "99999").unwrap();
-        // If the PID happens to exist on this machine the test becomes a no-op
-        // (not a failure); we just can't assume it's stale everywhere.
-        let result = acquire(d.path());
-        match result {
-            Ok(mut lock) => lock.release(),
-            Err(LockError::Held { .. }) => { /* 99999 is live on this machine — acceptable */ }
-            Err(e) => panic!("unexpected error: {e}"),
-        }
-    }
-
-    #[test]
-    fn create_race_loser_reports_held_not_io() {
-        // Simulates losing the O_EXCL create race: the lock file appears between
-        // acquire()'s exists() check and its create_new() call. The only way to
-        // observe that window deterministically is to have the file already hold
-        // a live PID that acquire() must attribute rather than clear.
-        //
-        // Regression guard: contention must surface as Held (so callers can show
-        // "another synapse is running"), never as Io("File exists").
-        let d = tmpdir();
-        let lock_path = d.path().join(".lock");
-        fs::write(&lock_path, std::process::id().to_string()).unwrap();
-
-        match acquire(d.path()) {
-            Err(LockError::Held { owner_pid }) => assert_eq!(owner_pid, std::process::id()),
-            Err(LockError::Io(e)) => panic!("contention misreported as I/O error: {e}"),
-            Ok(_) => panic!("acquired a lock held by a live process"),
-        }
-
-        fs::remove_file(&lock_path).unwrap();
+        // A leftover PID file is just bytes: no flock is held, so acquire
+        // succeeds regardless of what the contents claim.
+        fs::write(d.path().join(".lock"), "99999").unwrap();
+        acquire(d.path())
+            .expect("stale pid file must not block")
+            .release();
     }
 
     #[test]
     fn held_error_never_renders_as_file_exists() {
-        // The Display impl is user-facing; a race loser must not be told
-        // "File exists (os error 17)".
+        // The Display impl is user-facing; contention must not surface as a
+        // raw "File exists (os error 17)".
         let rendered = LockError::Held { owner_pid: 4242 }.to_string();
         assert!(rendered.contains("4242"), "should name the owning PID");
         assert!(

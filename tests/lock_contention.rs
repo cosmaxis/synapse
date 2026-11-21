@@ -28,8 +28,9 @@ fn scratch_config() -> PathBuf {
     dir
 }
 
-/// With a live PID in the lock file, `synapse update --all` must report
+/// With a real flock held by this process, `synapse update --all` must report
 /// contention in human terms and must not leak the raw OS error.
+#[cfg(unix)]
 #[test]
 fn update_reports_contention_not_io_error() {
     let cfg_home = scratch_config();
@@ -43,8 +44,25 @@ fn update_reports_contention_not_io_error() {
     )
     .unwrap();
 
-    // Claim the lock with a PID that is definitely alive: this test process.
-    fs::write(cfg_dir.join(".lock"), std::process::id().to_string()).unwrap();
+    // Claim the lock for real: flock(LOCK_EX) on the stable .lock inode. The
+    // PID inside is only what the child's error message will name.
+    let mut lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(cfg_dir.join(".lock"))
+        .unwrap();
+    {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+        lock_file.set_len(0).unwrap();
+        lock_file
+            .write_all(std::process::id().to_string().as_bytes())
+            .unwrap();
+        let ret = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+        assert_eq!(ret, 0, "flock failed: {}", std::io::Error::last_os_error());
+    }
 
     let out = Command::new(synapse_bin())
         .args(["update", "--all"])
@@ -78,15 +96,14 @@ fn update_reports_contention_not_io_error() {
     fs::remove_dir_all(&cfg_home).ok();
 }
 
-/// A stale lock (PID not running) must not block a new run.
+/// Lock contents are diagnostics only: a dead-PID `.lock` file must not block
+/// a new run, and the stable inode is retained rather than unlinked.
 #[test]
 fn stale_lock_does_not_block() {
     let cfg_home = scratch_config();
     let cfg_dir = cfg_home.join("synapse");
     fs::create_dir_all(&cfg_dir).unwrap();
 
-    // No packages installed: `update --all` exits early and cleanly. What we're
-    // asserting is that a stale lock is not itself treated as a hard failure.
     fs::write(cfg_dir.join("state.json"), r#"{"packages":{}}"#).unwrap();
     fs::write(cfg_dir.join(".lock"), "999999").unwrap();
 
@@ -103,8 +120,18 @@ fn stale_lock_does_not_block() {
     );
 
     assert!(
+        out.status.success(),
+        "stale lock blocked the run: {combined}"
+    );
+    assert!(
         !combined.contains("File exists") && !combined.contains("os error 17"),
         "stale lock produced a raw OS error: {combined}"
+    );
+    // The stable inode persists by design — unlinking it is what would reopen
+    // the check-then-act race flock exists to close.
+    assert!(
+        cfg_dir.join(".lock").exists(),
+        "lock inode was unlinked; it must persist for flock arbitration"
     );
 
     fs::remove_dir_all(&cfg_home).ok();
