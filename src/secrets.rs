@@ -118,9 +118,14 @@ pub fn write_local_environment(values: &BTreeMap<String, String>) -> io::Result<
     // stack restore still need their variables, and a wholesale replace
     // would silently strip their credentials. New values win on conflict;
     // stale namespaced variables linger harmlessly.
-    let mut merged = fs::read_to_string(&path)
-        .map(|content| parse_local_environment(&content))
-        .unwrap_or_default();
+    let mut merged = match fs::read_to_string(&path) {
+        Ok(content) => parse_local_environment(&content)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
+        // Any other read failure must not fall through to a wholesale
+        // rewrite — that would silently destroy the retained credentials
+        // this merge exists to protect.
+        Err(error) => return Err(error),
+    };
     merged.extend(
         values
             .iter()
@@ -140,33 +145,74 @@ pub fn write_local_environment(values: &BTreeMap<String, String>) -> io::Result<
     Ok(path)
 }
 
-/// Parse the `export NAME='value'` lines this module writes. Best-effort:
-/// lines that do not match the generated shape are skipped rather than
-/// failing the write, since the file is machine-managed.
-fn parse_local_environment(content: &str) -> BTreeMap<String, String> {
-    let mut values = BTreeMap::new();
-    for line in content.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("export ") else {
-            continue;
-        };
-        let Some((name, raw)) = rest.split_once('=') else {
-            continue;
-        };
-        if !valid_env_name(name) {
-            continue;
-        }
-        let raw = raw.trim();
-        if raw.len() < 2 || !raw.starts_with('\'') || !raw.ends_with('\'') {
-            continue;
-        }
-        // shell_quote emits 'it'\''s' — collapse the escape back to a quote.
-        values.insert(
-            name.to_string(),
-            raw[1..raw.len() - 1].replace("'\\''", "'"),
-        );
+/// Parse the `export NAME='value'` records this module writes. Values may
+/// span physical lines (shell_quote permits newlines), so this scans the
+/// whole buffer rather than line-by-line. The file is machine-managed:
+/// anything that is not a generated record — truncated quote, trailing
+/// garbage, unquoted value — is an error, never a silent drop.
+fn parse_local_environment(content: &str) -> io::Result<BTreeMap<String, String>> {
+    fn invalid(reason: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("malformed secrets.env: {reason}"),
+        )
     }
-    values
+
+    let mut values = BTreeMap::new();
+    let mut rest = content;
+    loop {
+        rest = rest.trim_start_matches(char::is_whitespace);
+        if rest.is_empty() {
+            return Ok(values);
+        }
+        if let Some(comment) = rest.strip_prefix('#') {
+            match comment.find('\n') {
+                Some(index) => rest = &comment[index + 1..],
+                None => return Ok(values),
+            }
+            continue;
+        }
+        let record = rest
+            .strip_prefix("export ")
+            .ok_or_else(|| invalid("expected an export record"))?;
+        let equals = record.find('=').ok_or_else(|| invalid("missing '='"))?;
+        let name = record[..equals].trim_end();
+        if !valid_env_name(name) {
+            return Err(invalid("invalid environment name"));
+        }
+        let quoted = record[equals + 1..]
+            .strip_prefix('\'')
+            .ok_or_else(|| invalid("value is not single-quoted"))?;
+        // shell_quote emits ' as '\'' — a quote followed by \'' is part
+        // of an escaped quote; any other quote closes the value.
+        let mut value = String::new();
+        let mut cursor = quoted;
+        loop {
+            let quote = cursor
+                .find('\'')
+                .ok_or_else(|| invalid("unterminated quote"))?;
+            value.push_str(&cursor[..quote]);
+            let after = &cursor[quote + 1..];
+            match after.strip_prefix("\\''") {
+                Some(remaining) => {
+                    value.push('\'');
+                    cursor = remaining;
+                }
+                None => {
+                    cursor = after;
+                    break;
+                }
+            }
+        }
+        // A record ends at end-of-line; anything else means the file was
+        // edited or truncated after generation.
+        let after = cursor.strip_prefix('\r').unwrap_or(cursor);
+        if !after.is_empty() && !after.starts_with('\n') {
+            return Err(invalid("trailing data after record"));
+        }
+        values.insert(name.to_string(), value);
+        rest = after;
+    }
 }
 
 pub fn valid_env_name(name: &str) -> bool {
@@ -285,5 +331,70 @@ mod tests {
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn local_environment_round_trips_quoted_and_multiline_values() {
+        let values = BTreeMap::from([
+            ("PLAIN".to_string(), "value".to_string()),
+            ("MULTILINE".to_string(), "line1\nline2".to_string()),
+            ("QUOTED".to_string(), "it's 'quoted'".to_string()),
+            ("COMMAND".to_string(), "$(not executed)".to_string()),
+        ]);
+        let mut content = String::from("# Generated by Synapse. Contains secrets; mode 0600.\n");
+        for (name, value) in &values {
+            content.push_str("export ");
+            content.push_str(name);
+            content.push('=');
+            content.push_str(&shell_quote(value));
+            content.push('\n');
+        }
+
+        assert_eq!(parse_local_environment(&content).unwrap(), values);
+    }
+
+    #[test]
+    fn local_environment_rejects_malformed_content() {
+        // Fail closed: a corrupt or hand-edited file must error rather than
+        // silently drop the credentials it contains.
+        assert!(parse_local_environment("export A='unterminated\n").is_err());
+        assert!(parse_local_environment("export A='v' trailing\n").is_err());
+        assert!(parse_local_environment("not an export\n").is_err());
+        assert!(parse_local_environment("export 1BAD='v'\n").is_err());
+        assert!(parse_local_environment("# comment\n\nexport A='v'\n").is_ok());
+    }
+    #[test]
+    fn local_environment_merge_preserves_retained_servers() {
+        let _guard = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        let dir = tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+
+        // First capture: server A credentials, including values that span
+        // physical lines and contain quotes.
+        write_local_environment(&BTreeMap::from([
+            ("A_TOKEN".to_string(), "line1\nline2".to_string()),
+            ("A_QUOTED".to_string(), "it's 'x'".to_string()),
+        ]))
+        .unwrap();
+
+        // Second capture only knows server B; the merge must retain A.
+        let path = write_local_environment(&BTreeMap::from([(
+            "B_TOKEN".to_string(),
+            "b-secret".to_string(),
+        )]))
+        .unwrap();
+
+        let parsed = parse_local_environment(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["A_TOKEN"], "line1\nline2");
+        assert_eq!(parsed["A_QUOTED"], "it's 'x'");
+        assert_eq!(parsed["B_TOKEN"], "b-secret");
+
+        match prev {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
     }
 }
