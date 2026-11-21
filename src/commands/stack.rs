@@ -1500,10 +1500,69 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
         ));
     }
     match skillshare_repository()? {
-        Some((_, current)) if current.remote == remote && current.git_root == git_root => Ok(()),
+        Some((repo, current)) if current.remote == remote && current.git_root == git_root => {
+            // `skillshare init --remote` writes config and an empty repository;
+            // it does not clone the remote. Fetch the remote default branch so
+            // the captured stack is actually present for the follow-up
+            // `stack restore --trust`.
+            fetch_skillshare_remote(&repo)?;
+            Ok(())
+        }
         _ => Err(io::Error::other(
             "Skillshare initialization did not produce the requested Git source",
         )),
+    }
+}
+
+/// Fetch the remote's default branch into a freshly initialized Skillshare
+/// repository. Without this the repo stays at its boilerplate commit and the
+/// captured stack never reaches a new machine.
+fn fetch_skillshare_remote(repo: &Path) -> io::Result<()> {
+    git_run(repo, &["fetch", "origin"])?;
+    // ls-remote reports the remote's symbolic HEAD; an empty remote has no
+    // branch to restore, which the caller surfaces as a missing stack dir.
+    let Some(symref) = git_output(repo, &["ls-remote", "--symref", "origin", "HEAD"]) else {
+        return Ok(());
+    };
+    let Some(branch) = symref
+        .lines()
+        .find_map(|line| line.strip_prefix("ref:"))
+        .and_then(|reference| reference.split_whitespace().next())
+        .and_then(|reference| reference.strip_prefix("refs/heads/"))
+    else {
+        return Ok(());
+    };
+    // The repo was just initialized and holds only boilerplate, so resetting
+    // to the remote state is safe and avoids a divergent merge commit.
+    let target = format!("origin/{branch}");
+    git_run(repo, &["reset", "--hard", target.as_str()])
+}
+
+fn git_run(repo: &Path, args: &[&str]) -> io::Result<()> {
+    let git = env::var_os("SYNAPSE_GIT_BIN").unwrap_or_else(|| "git".into());
+    let status = Command::new(git)
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .status()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to run git {} in {}: {error}",
+                    args.join(" "),
+                    repo.display()
+                ),
+            )
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "git {} failed in {}",
+            args.join(" "),
+            repo.display()
+        )))
     }
 }
 
@@ -3822,6 +3881,13 @@ mod tests {
             "#!/bin/sh\n\
              if [ \"$3\" = remote ] && [ \"$4\" = get-url ]; then\n\
                printf '%s\\n' \"$SYNAPSE_TEST_REMOTE\"\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$3\" = ls-remote ]; then\n\
+               printf 'ref: refs/heads/main\\tHEAD\\n0123456789abcdef0123456789abcdef01234567\\tHEAD\\n'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$3\" = fetch ] || [ \"$3\" = reset ]; then\n\
                exit 0\n\
              fi\n\
              exit 1\n",
