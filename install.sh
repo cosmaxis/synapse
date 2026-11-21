@@ -129,6 +129,9 @@ VERSION="${SYNAPSE_VERSION:-}"
 
 if [ -n "${SYNAPSE_BASE_URL:-}" ]; then
   BASE_URL="${SYNAPSE_BASE_URL%/}"
+  if [ -n "${SYNAPSE_VERSION:-}" ]; then
+    warn "SYNAPSE_VERSION=$SYNAPSE_VERSION is ignored for asset selection when SYNAPSE_BASE_URL is set"
+  fi
   [ -n "$VERSION" ] || VERSION='(SYNAPSE_BASE_URL)'
 else
   if [ -z "$VERSION" ]; then

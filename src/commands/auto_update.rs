@@ -18,6 +18,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 
 use crate::platform;
+use crate::secrets::shell_quote;
 use crate::state;
 
 // ── Config schema ─────────────────────────────────────────────────────────────
@@ -212,15 +213,35 @@ pub fn enable() -> io::Result<()> {
     let cfg = read_config()?;
     write_config(&cfg)?;
 
-    let parts: Vec<&str> = cfg.preferred_time.split(':').collect();
-    let hour: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(2);
-    let minute: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let (hour, minute) = parse_preferred_time(&cfg.preferred_time)
+        .map_err(|e| io::Error::new(e.kind(), format!("{} ({})", e, config_path().display())))?;
 
     match detect_backend() {
         Backend::Launchd => enable_launchd(hour, minute),
         Backend::Systemd => enable_systemd(hour, minute),
         Backend::Cron => enable_cron(hour, minute),
     }
+}
+
+/// Parse `HH:MM` into (hour, minute). Rejects anything else: a bad value must
+/// fail loudly at enable time, not reach OnCalendar/plist/crontab verbatim.
+fn parse_preferred_time(value: &str) -> io::Result<(u32, u32)> {
+    let bad = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("preferred_time must be HH:MM, got {value:?}"),
+        )
+    };
+    let (h, m) = value.split_once(':').ok_or_else(bad)?;
+    if h.len() != 2 || m.len() != 2 {
+        return Err(bad());
+    }
+    let hour: u32 = h.parse().map_err(|_| bad())?;
+    let minute: u32 = m.parse().map_err(|_| bad())?;
+    if hour >= 24 || minute >= 60 {
+        return Err(bad());
+    }
+    Ok((hour, minute))
 }
 
 // ── launchd ───────────────────────────────────────────────────────────────────
@@ -232,7 +253,12 @@ fn enable_launchd(hour: u32, minute: u32) -> io::Result<()> {
         return Ok(());
     }
 
-    let exe = synapse_exe_path();
+    let exe_xml = xml_escape(&synapse_exe_path());
+    let log_xml = xml_escape(
+        &state::config_dir()
+            .join("auto-update.log")
+            .to_string_lossy(),
+    );
     let plist_path = launchd_plist_path()?;
     if let Some(p) = plist_path.parent() {
         fs::create_dir_all(p)?;
@@ -247,7 +273,7 @@ fn enable_launchd(hour: u32, minute: u32) -> io::Result<()> {
     <key>Label</key>          <string>{LAUNCHD_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{exe}</string>
+        <string>{exe_xml}</string>
         <string>auto-update</string>
         <string>now</string>
     </array>
@@ -257,8 +283,8 @@ fn enable_launchd(hour: u32, minute: u32) -> io::Result<()> {
         <key>Minute</key> <integer>{minute}</integer>
     </dict>
     <key>RunAtLoad</key>          <false/>
-    <key>StandardOutPath</key>    <string>/tmp/synapse-auto-update.log</string>
-    <key>StandardErrorPath</key>  <string>/tmp/synapse-auto-update.log</string>
+    <key>StandardOutPath</key>    <string>{log_xml}</string>
+    <key>StandardErrorPath</key>  <string>{log_xml}</string>
 </dict>
 </plist>
 "#
@@ -332,7 +358,7 @@ fn enable_systemd(hour: u32, minute: u32) -> io::Result<()> {
         return Ok(());
     }
 
-    let exe = synapse_exe_path();
+    let exe = systemd_quote(&synapse_exe_path());
     let dir = systemd_unit_dir()?;
     fs::create_dir_all(&dir)?;
 
@@ -443,10 +469,13 @@ fn run_systemctl(args: &[&str]) -> io::Result<()> {
 // ── cron ──────────────────────────────────────────────────────────────────────
 
 fn enable_cron(hour: u32, minute: u32) -> io::Result<()> {
-    let exe = synapse_exe_path();
-    let entry = format!(
-        "{minute} {hour} * * * {exe} auto-update now >> /tmp/synapse-auto-update.log 2>&1 {CRON_MARKER}"
+    let exe = shell_quote(&synapse_exe_path());
+    let log = shell_quote(
+        &state::config_dir()
+            .join("auto-update.log")
+            .to_string_lossy(),
     );
+    let entry = format!("{minute} {hour} * * * {exe} auto-update now >> {log} 2>&1 {CRON_MARKER}");
 
     let existing = crontab_read()?;
     if existing.lines().any(|l| l.contains(CRON_MARKER)) {
@@ -492,11 +521,20 @@ fn disable_cron() -> io::Result<()> {
 
 fn crontab_read() -> io::Result<String> {
     let out = Command::new("crontab").arg("-l").output()?;
-    // crontab -l exits non-zero when no crontab exists — treat as empty.
     if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
+        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+    }
+    // Non-zero is only "empty" when the scheduler reports no crontab at all;
+    // any other failure must not be mistaken for an empty crontab — writing
+    // the result back would silently drop every existing entry.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.to_lowercase().contains("no crontab") {
         Ok(String::new())
+    } else {
+        Err(io::Error::other(format!(
+            "crontab -l failed: {}",
+            stderr.trim()
+        )))
     }
 }
 
@@ -606,6 +644,30 @@ fn synapse_exe_path() -> String {
         .unwrap_or_else(|_| "synapse".to_string())
 }
 
+/// Quote an executable path for a systemd `ExecStart=` line.
+///
+/// systemd splits the line on whitespace; quoting is needed only when the path
+/// contains it (or a shell-like metachar). `'`/`\` inside double quotes stay
+/// literal, so single-quoting would be wrong — use `shell_quote` for shells.
+fn systemd_quote(path: &str) -> String {
+    if path.chars().any(|c| {
+        c.is_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>' | '`' | '$' | '"' | '\'')
+    }) {
+        format!("\"{path}\"")
+    } else {
+        path.to_string()
+    }
+}
+
+/// Minimal XML escaping for plist `<string>` contents.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,10 +734,17 @@ mod tests {
 
     #[test]
     fn preferred_time_parses_to_hour_minute() {
-        let parts: Vec<&str> = "02:30".split(':').collect();
-        let h: u32 = parts[0].parse().unwrap();
-        let m: u32 = parts[1].parse().unwrap();
-        assert_eq!((h, m), (2, 30));
+        assert_eq!(parse_preferred_time("02:30").unwrap(), (2, 30));
+        assert_eq!(parse_preferred_time("00:00").unwrap(), (0, 0));
+        assert_eq!(parse_preferred_time("23:59").unwrap(), (23, 59));
+    }
+
+    #[test]
+    fn preferred_time_rejects_bad_values() {
+        for bad in ["25:00", "12:60", "2:30", "02:3", "02:30:45", "noon", ""] {
+            let e = parse_preferred_time(bad).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "input {bad:?}");
+        }
     }
 
     #[test]
@@ -764,11 +833,12 @@ mod tests {
                 }
             }
 
-            // The lock must also be released, not left behind for the next run.
-            assert!(
-                !cfg_dir.join(".lock").exists(),
-                "run_now leaked the state lock"
-            );
+            // The lock must be released, not left held for the next run. The
+            // .lock inode persists by design (flock needs a stable file), so
+            // prove release by re-acquiring rather than checking absence.
+            state::acquire(&cfg_dir)
+                .expect("run_now leaked the state lock")
+                .release();
         });
     }
 
