@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -1580,7 +1580,7 @@ fn fetch_skillshare_remote(repo: &Path) -> io::Result<()> {
     let target = format!("origin/{branch}");
     // An empty remote tree is a graceful no-op; checkout of an empty tree
     // would delete local files, so the guard is required.
-    let Some(tree) = git_output(repo, &["ls-tree", "--name-only", target.as_str()]) else {
+    let Some(tree) = git_output(repo, &["ls-tree", "-r", "--name-only", target.as_str()]) else {
         return Ok(());
     };
     if tree.is_empty() {
@@ -1594,6 +1594,24 @@ fn fetch_skillshare_remote(repo: &Path) -> io::Result<()> {
         return Err(io::Error::other(
             "Skillshare repository has uncommitted changes; commit or stash them before restoring remote content",
         ));
+    }
+    // Ignored files (config.yaml, env files) are invisible to --porcelain
+    // but checkout still overwrites them when the remote tracks them.
+    if let Some(ignored) = git_output(
+        repo,
+        &["ls-files", "--others", "--ignored", "--exclude-standard"],
+    ) {
+        let remote_paths: HashSet<&str> = tree.lines().collect();
+        let collisions: Vec<&str> = ignored
+            .lines()
+            .filter(|path| remote_paths.contains(path))
+            .collect();
+        if !collisions.is_empty() {
+            let shown = collisions[..collisions.len().min(3)].join(", ");
+            return Err(io::Error::other(format!(
+                "Skillshare remote tracks file(s) ignored locally ({shown}); refusing to overwrite them"
+            )));
+        }
     }
     git_run(repo, &["checkout", target.as_str(), "--", "."])
 }
@@ -4311,6 +4329,87 @@ mod tests {
         assert_eq!(
             fs::read_to_string(local.join("agents/remote-agent.md")).unwrap(),
             "local agent\n"
+        );
+        assert!(!local.join(".synapse/stack/stack.json").exists());
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn fetch_skillshare_remote_refuses_ignored_collisions() {
+        let _lock = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tmpdir("skillshare-ignored");
+        let _git_bin = EnvGuard::set_text("SYNAPSE_GIT_BIN", "git");
+        let _author = EnvGuard::set_text("GIT_AUTHOR_NAME", "synapse-test");
+        let _aemail = EnvGuard::set_text("GIT_AUTHOR_EMAIL", "test@localhost");
+        let _cname = EnvGuard::set_text("GIT_COMMITTER_NAME", "synapse-test");
+        let _cemail = EnvGuard::set_text("GIT_COMMITTER_EMAIL", "test@localhost");
+
+        let git = |dir: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        // Remote tracks config.yaml (force-added upstream) plus the stack.
+        let remote_work = temp.join("remote-work");
+        let remote = temp.join("remote.git");
+        let local = temp.join("local");
+        fs::create_dir_all(remote_work.join(".synapse/stack")).unwrap();
+        fs::write(
+            remote_work.join(".synapse/stack/stack.json"),
+            "{\"version\":1}",
+        )
+        .unwrap();
+        fs::write(remote_work.join("config.yaml"), "remote: true\n").unwrap();
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&remote_work)
+            .output()
+            .unwrap();
+        git(&remote_work, &["add", "-A"]);
+        git(&remote_work, &["commit", "-qm", "stack export"]);
+        let remote_str = remote.to_string_lossy().into_owned();
+        git(&remote_work, &["push", remote_str.as_str(), "HEAD:main"]);
+
+        // Local repo ignores config.yaml and holds a live local one.
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&local)
+            .output()
+            .unwrap();
+        fs::write(local.join(".gitignore"), "config.yaml\n").unwrap();
+        fs::write(local.join("config.yaml"), "local: true\n").unwrap();
+        fs::create_dir_all(local.join("skills/my-skill")).unwrap();
+        fs::write(local.join("skills/my-skill/SKILL.md"), "local skill\n").unwrap();
+        git(&local, &["add", "-A"]);
+        git(&local, &["commit", "-qm", "Initial skills"]);
+        git(&local, &["remote", "add", "origin", remote_str.as_str()]);
+
+        let error = fetch_skillshare_remote(&local).unwrap_err();
+        assert!(
+            error.to_string().contains("ignored locally"),
+            "expected ignored-collision refusal, got: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(local.join("config.yaml")).unwrap(),
+            "local: true\n"
         );
         assert!(!local.join(".synapse/stack/stack.json").exists());
 
