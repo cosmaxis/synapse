@@ -1465,12 +1465,24 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
     if !matches!(git_root, "root" | "skills" | "agents" | "extras") {
         return Err(invalid_input("invalid Skillshare git_root"));
     }
-    if let Some((_, current)) = skillshare_repository()? {
+    if let Some((repo, current)) = skillshare_repository()? {
         if current.remote != remote || current.git_root != git_root {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "existing Skillshare Git source differs from the requested stack",
             ));
+        }
+        // A previous init may have written config and origin but failed before
+        // fetching, leaving no stack locally. Merge the remote default branch
+        // so the retry can restore; established repos with a committed stack
+        // keep their local state untouched.
+        if !repo
+            .join(".synapse")
+            .join("stack")
+            .join(MANIFEST_FILE)
+            .is_file()
+        {
+            fetch_skillshare_remote(&repo, false)?;
         }
         return Ok(());
     }
@@ -1505,7 +1517,7 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
             // it does not clone the remote. Fetch the remote default branch so
             // the captured stack is actually present for the follow-up
             // `stack restore --trust`.
-            fetch_skillshare_remote(&repo)?;
+            fetch_skillshare_remote(&repo, true)?;
             Ok(())
         }
         _ => Err(io::Error::other(
@@ -1514,47 +1526,64 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
     }
 }
 
-/// Fetch the remote's default branch into a freshly initialized Skillshare
-/// repository. Without this the repo stays at its boilerplate commit and the
-/// captured stack never reaches a new machine.
-fn fetch_skillshare_remote(repo: &Path) -> io::Result<()> {
+/// Fetch the remote's default branch into the Skillshare repository.
+/// `reset` is only for a freshly initialized repo (boilerplate only); retries
+/// against an existing repo merge instead so local commits are never lost.
+fn fetch_skillshare_remote(repo: &Path, reset: bool) -> io::Result<()> {
     git_run(repo, &["fetch", "origin"])?;
     // ls-remote reports the remote's symbolic HEAD; an empty remote has no
     // branch to restore, which the caller surfaces as a missing stack dir.
-    let Some(symref) = git_output(repo, &["ls-remote", "--symref", "origin", "HEAD"]) else {
+    let Some(branch) = remote_default_branch(repo) else {
         return Ok(());
     };
-    let Some(branch) = symref
+    let target = format!("origin/{branch}");
+    if reset {
+        git_run(repo, &["reset", "--hard", target.as_str()])
+    } else {
+        git_run_merge(repo, &["merge", "--no-edit", target.as_str()])
+    }
+}
+
+fn remote_default_branch(repo: &Path) -> Option<String> {
+    git_output(repo, &["ls-remote", "--symref", "origin", "HEAD"])?
         .lines()
         .find_map(|line| line.strip_prefix("ref:"))
         .and_then(|reference| reference.split_whitespace().next())
         .and_then(|reference| reference.strip_prefix("refs/heads/"))
-    else {
-        return Ok(());
-    };
-    // The repo was just initialized and holds only boilerplate, so resetting
-    // to the remote state is safe and avoids a divergent merge commit.
-    let target = format!("origin/{branch}");
-    git_run(repo, &["reset", "--hard", target.as_str()])
+        .map(str::to_string)
 }
 
 fn git_run(repo: &Path, args: &[&str]) -> io::Result<()> {
+    git_run_full(repo, args, false)
+}
+
+/// Merge commits need an author identity; a fresh machine may have no git
+/// config, so supply one rather than failing the retry loop.
+fn git_run_merge(repo: &Path, args: &[&str]) -> io::Result<()> {
+    git_run_full(repo, args, true)
+}
+
+fn git_run_full(repo: &Path, args: &[&str], merge_identity: bool) -> io::Result<()> {
     let git = env::var_os("SYNAPSE_GIT_BIN").unwrap_or_else(|| "git".into());
-    let status = Command::new(git)
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .status()
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "failed to run git {} in {}: {error}",
-                    args.join(" "),
-                    repo.display()
-                ),
-            )
-        })?;
+    let mut command = Command::new(git);
+    command.arg("-C").arg(repo).args(args);
+    if merge_identity {
+        command
+            .env("GIT_AUTHOR_NAME", "synapse")
+            .env("GIT_AUTHOR_EMAIL", "synapse@localhost")
+            .env("GIT_COMMITTER_NAME", "synapse")
+            .env("GIT_COMMITTER_EMAIL", "synapse@localhost");
+    }
+    let status = command.status().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to run git {} in {}: {error}",
+                args.join(" "),
+                repo.display()
+            ),
+        )
+    })?;
     if status.success() {
         Ok(())
     } else {
@@ -3888,7 +3917,7 @@ mod tests {
                printf 'ref: refs/heads/main\\tHEAD\\n0123456789abcdef0123456789abcdef01234567\\tHEAD\\n'\n\
                exit 0\n\
              fi\n\
-             if [ \"$3\" = fetch ] || [ \"$3\" = reset ]; then\n\
+             if [ \"$3\" = fetch ] || [ \"$3\" = reset ] || [ \"$3\" = merge ]; then\n\
                exit 0\n\
              fi\n\
              exit 1\n",
@@ -3942,6 +3971,105 @@ mod tests {
                 "missing git {expected} in:\n{git_log}"
             );
         }
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn restore_remote_retries_fetch_after_failed_bootstrap() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tmpdir("skillshare-retry");
+        let config = temp.join("config");
+        let input = temp.join("stack");
+        let git_log = temp.join("git.log");
+        let state = temp.join("state");
+        let fake_skillshare = temp.join("skillshare-fake");
+        let fake_git = temp.join("git-fake");
+        let remote = "git@github.com:example/ai-stack.git";
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join("fail-fetch"), "").unwrap();
+        fs::write(
+            &fake_skillshare,
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"$SYNAPSE_TEST_LOG\"\n\
+             if [ \"$1\" = init ]; then\n\
+               mkdir -p \"$XDG_CONFIG_HOME/skillshare\"\n\
+               printf 'git_root: root\\n' > \"$XDG_CONFIG_HOME/skillshare/config.yaml\"\n\
+             fi\n",
+        )
+        .unwrap();
+        // fetch fails while the flag file exists; reset/merge simulate the
+        // remote content landing by materializing stack.json in the repo.
+        fs::write(
+            &fake_git,
+            "#!/bin/sh\n\
+             printf 'git %s\\n' \"$*\" >> \"$SYNAPSE_TEST_GIT_LOG\"\n\
+             case \"$3\" in\n\
+               remote)\n\
+                 if [ \"$4\" = get-url ]; then\n\
+                   printf '%s\\n' \"$SYNAPSE_TEST_REMOTE\"\n\
+                   exit 0\n\
+                 fi\n\
+                 exit 1;;\n\
+               fetch)\n\
+                 if [ -f \"$SYNAPSE_TEST_STATE/fail-fetch\" ]; then exit 1; fi\n\
+                 exit 0;;\n\
+               ls-remote)\n\
+                 printf 'ref: refs/heads/main\\tHEAD\\n0123456789abcdef0123456789abcdef01234567\\tHEAD\\n'\n\
+                 exit 0;;\n\
+               reset|merge)\n\
+                 mkdir -p \"$2/.synapse/stack\"\n\
+                 : > \"$2/.synapse/stack/stack.json\"\n\
+                 exit 0;;\n\
+             esac\n\
+             exit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_skillshare, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755)).unwrap();
+        let _config = EnvGuard::set("XDG_CONFIG_HOME", &config);
+        let _omp = EnvGuard::set("SYNAPSE_OMP_DIR", &temp.join("omp"));
+        let _skillshare = EnvGuard::set("SYNAPSE_SKILLSHARE_BIN", &fake_skillshare);
+        let _git = EnvGuard::set("SYNAPSE_GIT_BIN", &fake_git);
+        let _log = EnvGuard::set("SYNAPSE_TEST_LOG", &temp.join("skillshare.log"));
+        let _git_log = EnvGuard::set("SYNAPSE_TEST_GIT_LOG", &git_log);
+        let _state = EnvGuard::set("SYNAPSE_TEST_STATE", &state);
+        let _remote = EnvGuard::set("SYNAPSE_TEST_REMOTE", Path::new(remote));
+        let manifest = StackManifest {
+            version: STACK_VERSION,
+            omp_profiles: Vec::new(),
+            skillshare: Some(SkillshareSource {
+                remote: remote.into(),
+                git_root: "root".into(),
+            }),
+        };
+        write_json(&input.join(MANIFEST_FILE), &manifest).unwrap();
+
+        // First attempt: init persists config/origin, fetch fails.
+        assert!(restore(Some(&input), Some(remote), "root", false, false).is_err());
+
+        // Retry: the matching repo must fetch and merge the remote default
+        // branch instead of returning early with no stack present.
+        fs::remove_file(state.join("fail-fetch")).unwrap();
+        restore(Some(&input), Some(remote), "root", true, false).unwrap();
+
+        let repo = config.join("skillshare");
+        assert!(repo.join(".synapse/stack/stack.json").is_file());
+        let git_log = fs::read_to_string(&git_log).unwrap();
+        assert!(
+            git_log.contains("merge --no-edit origin/main"),
+            "retry must merge remote default branch, got:\n{git_log}"
+        );
+        assert_eq!(
+            git_log.matches("fetch origin").count(),
+            2,
+            "expected one failed and one successful fetch, got:\n{git_log}"
+        );
+
         fs::remove_dir_all(temp).ok();
     }
 }
