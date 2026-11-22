@@ -58,35 +58,37 @@ jobs:
 
   # ── Per-target build ───────────────────────────────────────────────────────
   #
-  # Fleet runners are all ARM64, so x86_64 assets are cross-compiled/emulated;
-  # the host-triple assertion below will fail for those entries until an
-  # x86_64 runner exists. The arm64 entries still build natively.
+  # Fleet runners are ARM64-only, so x86_64 assets cannot be built natively
+  # there: `cargo build` only targets the host triple, the host-triple
+  # assertion below requires a real x86_64 rustc, and the flake's
+  # buildRustPackage has no pkgsCross setup for ARM64→x86_64. x86_64 matrix
+  # entries carry a hosted runs_on label and build on GitHub-hosted runners;
+  # the aarch64 entries stay on the fleet. All four release assets are still
+  # produced — nothing is dropped.
   build:
     name: build ${{ matrix.target }}
     needs: version
-    runs-on:
-      group: Default
-      labels:
-        - self-hosted
-        - ${{ matrix.runner }}
-        - ARM64
-        - mac-server
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             runner: macOS
+            runs_on: '{"group":"Default","labels":["self-hosted","macOS","ARM64","mac-server"]}'
           - os: macos-15-intel
             target: x86_64-apple-darwin
             runner: macOS
+            runs_on: '"macos-15-intel"'
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             runner: Linux
+            runs_on: '"ubuntu-22.04"'
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             runner: Linux
+            runs_on: '{"group":"Default","labels":["self-hosted","Linux","ARM64","mac-server"]}'
     steps:
       - uses: actions/checkout@v4
 
