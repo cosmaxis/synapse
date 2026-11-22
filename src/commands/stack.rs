@@ -1473,16 +1473,16 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
             ));
         }
         // A previous init may have written config and origin but failed before
-        // fetching, leaving no stack locally. Merge the remote default branch
-        // so the retry can restore; established repos with a committed stack
-        // keep their local state untouched.
+        // fetching, leaving no stack locally. Materialize the remote default
+        // branch's stack so the retry can restore; established repos with a
+        // committed stack keep their local state untouched.
         if !repo
             .join(".synapse")
             .join("stack")
             .join(MANIFEST_FILE)
             .is_file()
         {
-            fetch_skillshare_remote(&repo, false)?;
+            fetch_skillshare_remote(&repo)?;
         }
         return Ok(());
     }
@@ -1514,10 +1514,10 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
     match skillshare_repository()? {
         Some((repo, current)) if current.remote == remote && current.git_root == git_root => {
             // `skillshare init --remote` writes config and an empty repository;
-            // it does not clone the remote. Fetch the remote default branch so
-            // the captured stack is actually present for the follow-up
+            // it does not clone the remote. Materialize the remote default
+            // branch's stack so it is actually present for the follow-up
             // `stack restore --trust`.
-            fetch_skillshare_remote(&repo, true)?;
+            fetch_skillshare_remote(&repo)?;
             Ok(())
         }
         _ => Err(io::Error::other(
@@ -1526,11 +1526,10 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
     }
 }
 
-/// Fetch the remote's default branch into the Skillshare repository.
-/// `fresh` is only for a repo `skillshare init` just created (boilerplate
-/// only); an existing repo missing the stack gets a safe fast-forward or a
-/// loud refusal — never a reset that could discard local commits.
-fn fetch_skillshare_remote(repo: &Path, fresh: bool) -> io::Result<()> {
+/// Fetch the remote's default branch and materialize the captured stack into
+/// the worktree. History is never touched, so this is safe for boilerplate,
+/// established, and diverged repositories alike — no local work can be lost.
+fn fetch_skillshare_remote(repo: &Path) -> io::Result<()> {
     git_run(repo, &["fetch", "origin"])?;
     // ls-remote reports the remote's symbolic HEAD; an empty remote has no
     // branch to restore, which the caller surfaces as a missing stack dir.
@@ -1538,29 +1537,12 @@ fn fetch_skillshare_remote(repo: &Path, fresh: bool) -> io::Result<()> {
         return Ok(());
     };
     let target = format!("origin/{branch}");
-    if fresh {
-        return git_run(repo, &["reset", "--hard", target.as_str()]);
+    // cat-file keeps a stack-less remote a graceful no-op.
+    let manifest = format!("{target}:.synapse/stack/{MANIFEST_FILE}");
+    if git_exit(repo, &["cat-file", "-e", manifest.as_str()])? != 0 {
+        return Ok(());
     }
-    // HEAD is an ancestor of the remote default: fast-forward, no merge
-    // commit and no author identity required.
-    if git_exit(
-        repo,
-        &["merge-base", "--is-ancestor", "HEAD", target.as_str()],
-    )? == 0
-    {
-        return git_run(repo, &["merge", "--ff-only", target.as_str()]);
-    }
-    // Unrelated histories can only be a just-initialized boilerplate repo;
-    // resetting it is lossless. Anything else is established local work the
-    // user must reconcile themselves.
-    let related = git_exit(repo, &["merge-base", "HEAD", target.as_str()])? == 0;
-    if !related && is_skillshare_boilerplate(repo) {
-        return git_run(repo, &["reset", "--hard", target.as_str()]);
-    }
-    Err(io::Error::other(format!(
-        "Skillshare repository at {} cannot fast-forward to {target}; resolve its history manually",
-        repo.display()
-    )))
+    git_run(repo, &["checkout", target.as_str(), "--", ".synapse/stack"])
 }
 
 fn remote_default_branch(repo: &Path) -> Option<String> {
@@ -1570,14 +1552,6 @@ fn remote_default_branch(repo: &Path) -> Option<String> {
         .and_then(|reference| reference.split_whitespace().next())
         .and_then(|reference| reference.strip_prefix("refs/heads/"))
         .map(str::to_string)
-}
-
-/// A repo `skillshare init` just created holds a single "Initial skills"
-/// commit and no local work; resetting it to the remote is lossless.
-fn is_skillshare_boilerplate(repo: &Path) -> bool {
-    git_output(repo, &["rev-list", "--count", "HEAD"]).as_deref() == Some("1")
-        && git_output(repo, &["log", "-1", "--format=%s"]).as_deref() == Some("Initial skills")
-        && git_output(repo, &["status", "--porcelain"]).is_some_and(|out| out.is_empty())
 }
 
 fn git_run(repo: &Path, args: &[&str]) -> io::Result<()> {
@@ -3951,7 +3925,7 @@ mod tests {
                printf 'ref: refs/heads/main\\tHEAD\\n0123456789abcdef0123456789abcdef01234567\\tHEAD\\n'\n\
                exit 0\n\
              fi\n\
-             if [ \"$3\" = fetch ] || [ \"$3\" = reset ] || [ \"$3\" = merge ] || [ \"$3\" = merge-base ]; then\n\
+             if [ \"$3\" = fetch ] || [ \"$3\" = cat-file ] || [ \"$3\" = checkout ]; then\n\
                exit 0\n\
              fi\n\
              exit 1\n",
@@ -3998,7 +3972,7 @@ mod tests {
         for expected in [
             "fetch origin",
             "ls-remote --symref origin HEAD",
-            "reset --hard origin/main",
+            "checkout origin/main -- .synapse/stack",
         ] {
             assert!(
                 git_log.contains(expected),
@@ -4036,7 +4010,7 @@ mod tests {
              fi\n",
         )
         .unwrap();
-        // fetch fails while the flag file exists; reset/merge simulate the
+        // fetch fails while the flag file exists; checkout simulates the
         // remote content landing by materializing stack.json in the repo.
         fs::write(
             &fake_git,
@@ -4055,17 +4029,9 @@ mod tests {
                ls-remote)\n\
                  printf 'ref: refs/heads/main\\tHEAD\\n0123456789abcdef0123456789abcdef01234567\\tHEAD\\n'\n\
                  exit 0;;\n\
-               merge-base)\n\
-                 exit 1;;\n\
-               rev-list)\n\
-                 printf '1\\n'\n\
+               cat-file)\n\
                  exit 0;;\n\
-               log)\n\
-                 printf 'Initial skills\\n'\n\
-                 exit 0;;\n\
-               status)\n\
-                 exit 0;;\n\
-               reset|merge)\n\
+               checkout)\n\
                  mkdir -p \"$2/.synapse/stack\"\n\
                  : > \"$2/.synapse/stack/stack.json\"\n\
                  exit 0;;\n\
@@ -4097,8 +4063,8 @@ mod tests {
         assert!(restore(Some(&input), Some(remote), "root", false, false).is_err());
 
         // Retry: the matching repo must fetch the remote default branch and
-        // reset the unrelated boilerplate history instead of returning early
-        // with no stack present.
+        // materialize its stack into the worktree instead of returning early
+        // with nothing present.
         fs::remove_file(state.join("fail-fetch")).unwrap();
         restore(Some(&input), Some(remote), "root", true, false).unwrap();
 
@@ -4106,17 +4072,102 @@ mod tests {
         assert!(repo.join(".synapse/stack/stack.json").is_file());
         let git_log = fs::read_to_string(&git_log).unwrap();
         assert!(
-            git_log.contains("reset --hard origin/main"),
-            "unrelated boilerplate must reset to remote default, got:\n{git_log}"
+            git_log.contains("checkout origin/main -- .synapse/stack"),
+            "retry must materialize the remote stack, got:\n{git_log}"
         );
         assert!(
-            !git_log.contains("merge --no-edit"),
-            "unrelated histories must not be merged, got:\n{git_log}"
+            !git_log.contains("reset --hard") && !git_log.contains("merge"),
+            "remote sync must never rewrite history, got:\n{git_log}"
         );
         assert_eq!(
             git_log.matches("fetch origin").count(),
             2,
             "expected one failed and one successful fetch, got:\n{git_log}"
+        );
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn fetch_skillshare_remote_preserves_local_history() {
+        let _lock = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tmpdir("skillshare-preserve");
+        let _git_bin = EnvGuard::set_text("SYNAPSE_GIT_BIN", "git");
+        let _author = EnvGuard::set_text("GIT_AUTHOR_NAME", "synapse-test");
+        let _aemail = EnvGuard::set_text("GIT_AUTHOR_EMAIL", "test@localhost");
+        let _cname = EnvGuard::set_text("GIT_COMMITTER_NAME", "synapse-test");
+        let _cemail = EnvGuard::set_text("GIT_COMMITTER_EMAIL", "test@localhost");
+
+        let git = |dir: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        // Remote default branch carries the captured stack.
+        let remote_work = temp.join("remote-work");
+        let remote = temp.join("remote.git");
+        let local = temp.join("local");
+        fs::create_dir_all(remote_work.join(".synapse/stack")).unwrap();
+        fs::write(
+            remote_work.join(".synapse/stack/stack.json"),
+            "{\"version\":1}",
+        )
+        .unwrap();
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&remote_work)
+            .output()
+            .unwrap();
+        git(&remote_work, &["add", "-A"]);
+        git(&remote_work, &["commit", "-qm", "stack export"]);
+        let remote_str = remote.to_string_lossy().into_owned();
+        git(&remote_work, &["push", remote_str.as_str(), "HEAD:main"]);
+
+        // Local repo: unrelated "Initial skills" commit containing a real
+        // skill file — the case a hard reset would destroy.
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&local)
+            .output()
+            .unwrap();
+        fs::create_dir_all(local.join("skills/my-skill")).unwrap();
+        fs::write(local.join("skills/my-skill/SKILL.md"), "local skill\n").unwrap();
+        git(&local, &["add", "-A"]);
+        git(&local, &["commit", "-qm", "Initial skills"]);
+        git(&local, &["remote", "add", "origin", remote_str.as_str()]);
+
+        fetch_skillshare_remote(&local).unwrap();
+
+        // Stack materialized; local commit, skill file, and worktree intact.
+        assert!(local.join(".synapse/stack/stack.json").is_file());
+        assert_eq!(
+            git_output(&local, &["rev-list", "--count", "HEAD"]).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            git_output(&local, &["log", "-1", "--format=%s"]).as_deref(),
+            Some("Initial skills")
+        );
+        assert_eq!(
+            fs::read_to_string(local.join("skills/my-skill/SKILL.md")).unwrap(),
+            "local skill\n"
         );
 
         fs::remove_dir_all(temp).ok();
