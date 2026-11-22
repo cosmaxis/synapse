@@ -54,13 +54,10 @@ jobs:
   # ── Rust build + tests across every supported platform ────────────────────
   test:
     name: test ${{ matrix.name }}
-    runs-on:
-      group: Default
-      labels:
-        - self-hosted
-        - ${{ matrix.runner }}
-        - ARM64
-        - mac-server
+    # Fleet runners are ARM64-only. Legs that need a native x86_64 toolchain
+    # or runner (arch assertions, Intel macOS) carry a hosted runs_on label;
+    # everything else carries the fleet group/labels. fromJSON picks the type.
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
       fail-fast: false
       matrix:
@@ -69,18 +66,22 @@ jobs:
             os: macos-15-intel
             runner: macOS
             arch: x86_64
+            runs_on: '"macos-15-intel"'
           - name: macos-arm-aarch64
-            os: macos-14
+            os: macos-15
             runner: macOS
             arch: aarch64
+            runs_on: '{"group":"Default","labels":["self-hosted","macOS","ARM64","mac-server"]}'
           - name: linux-x86_64
             os: ubuntu-22.04
             runner: Linux
             arch: x86_64
+            runs_on: '"ubuntu-22.04"'
           - name: linux-aarch64
             os: ubuntu-22.04-arm
             runner: Linux
             arch: aarch64
+            runs_on: '{"group":"Default","labels":["self-hosted","Linux","ARM64","mac-server"]}'
     steps:
       - uses: actions/checkout@v4
 
@@ -117,23 +118,19 @@ jobs:
   # ── Shell integration, per platform and per shell ──────────────────────────
   shell-integration:
     name: shell ${{ matrix.name }}
-    runs-on:
-      group: Default
-      labels:
-        - self-hosted
-        - ${{ matrix.runner }}
-        - ARM64
-        - mac-server
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: macos-arm
-            os: macos-14
+            os: macos-15
             runner: macOS
+            runs_on: '{"group":"Default","labels":["self-hosted","macOS","ARM64","mac-server"]}'
           - name: linux-x86_64
             os: ubuntu-22.04
             runner: Linux
+            runs_on: '"ubuntu-22.04"'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -173,13 +170,7 @@ jobs:
   # the other targets follow nixos-unstable.
   nix-flake:
     name: nix ${{ matrix.nix_system }}
-    runs-on:
-      group: Default
-      labels:
-        - self-hosted
-        - ${{ matrix.runner }}
-        - ARM64
-        - mac-server
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
       fail-fast: false
       matrix:
@@ -187,15 +178,19 @@ jobs:
           - os: macos-15-intel
             nix_system: x86_64-darwin
             runner: macOS
-          - os: macos-14
+            runs_on: '"macos-15-intel"'
+          - os: macos-15
             nix_system: aarch64-darwin
             runner: macOS
+            runs_on: '{"group":"Default","labels":["self-hosted","macOS","ARM64","mac-server"]}'
           - os: ubuntu-22.04
             nix_system: x86_64-linux
             runner: Linux
+            runs_on: '"ubuntu-22.04"'
           - os: ubuntu-22.04-arm
             nix_system: aarch64-linux
             runner: Linux
+            runs_on: '{"group":"Default","labels":["self-hosted","Linux","ARM64","mac-server"]}'
     steps:
       - uses: actions/checkout@v4
 
@@ -266,24 +261,20 @@ jobs:
   # ── Install / update / rollback / uninstall lifecycle ──────────────────────
   lifecycle:
     name: lifecycle ${{ matrix.nix_system }}
-    runs-on:
-      group: Default
-      labels:
-        - self-hosted
-        - ${{ matrix.runner }}
-        - ARM64
-        - mac-server
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
     needs: nix-flake
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             nix_system: aarch64-darwin
             runner: macOS
+            runs_on: '{"group":"Default","labels":["self-hosted","macOS","ARM64","mac-server"]}'
           - os: ubuntu-22.04
             nix_system: x86_64-linux
             runner: Linux
+            runs_on: '"ubuntu-22.04"'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
