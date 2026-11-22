@@ -16,7 +16,13 @@ jobs:
   # ── Fast feedback: lint on one platform ────────────────────────────────────
   lint:
     name: clippy
-    runs-on: ubuntu-22.04
+    runs-on:
+      group: Default
+      labels:
+        - self-hosted
+        - Linux
+        - ARM64
+        - mac-server
     steps:
       - uses: actions/checkout@v4
 
@@ -48,22 +54,32 @@ jobs:
   # ── Rust build + tests across every supported platform ────────────────────
   test:
     name: test ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
+    runs-on:
+      group: Default
+      labels:
+        - self-hosted
+        - ${{ matrix.runner }}
+        - ARM64
+        - mac-server
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: macos-intel-x86_64
             os: macos-15-intel
+            runner: macOS
             arch: x86_64
           - name: macos-arm-aarch64
             os: macos-14
+            runner: macOS
             arch: aarch64
           - name: linux-x86_64
             os: ubuntu-22.04
+            runner: Linux
             arch: x86_64
           - name: linux-aarch64
             os: ubuntu-22.04-arm
+            runner: Linux
             arch: aarch64
     steps:
       - uses: actions/checkout@v4
@@ -101,15 +117,23 @@ jobs:
   # ── Shell integration, per platform and per shell ──────────────────────────
   shell-integration:
     name: shell ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
+    runs-on:
+      group: Default
+      labels:
+        - self-hosted
+        - ${{ matrix.runner }}
+        - ARM64
+        - mac-server
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: macos-arm
             os: macos-14
+            runner: macOS
           - name: linux-x86_64
             os: ubuntu-22.04
+            runner: Linux
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -149,19 +173,29 @@ jobs:
   # the other targets follow nixos-unstable.
   nix-flake:
     name: nix ${{ matrix.nix_system }}
-    runs-on: ${{ matrix.os }}
+    runs-on:
+      group: Default
+      labels:
+        - self-hosted
+        - ${{ matrix.runner }}
+        - ARM64
+        - mac-server
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-15-intel
             nix_system: x86_64-darwin
+            runner: macOS
           - os: macos-14
             nix_system: aarch64-darwin
+            runner: macOS
           - os: ubuntu-22.04
             nix_system: x86_64-linux
+            runner: Linux
           - os: ubuntu-22.04-arm
             nix_system: aarch64-linux
+            runner: Linux
     steps:
       - uses: actions/checkout@v4
 
@@ -232,7 +266,13 @@ jobs:
   # ── Install / update / rollback / uninstall lifecycle ──────────────────────
   lifecycle:
     name: lifecycle ${{ matrix.nix_system }}
-    runs-on: ${{ matrix.os }}
+    runs-on:
+      group: Default
+      labels:
+        - self-hosted
+        - ${{ matrix.runner }}
+        - ARM64
+        - mac-server
     needs: nix-flake
     strategy:
       fail-fast: false
@@ -240,8 +280,10 @@ jobs:
         include:
           - os: macos-14
             nix_system: aarch64-darwin
+            runner: macOS
           - os: ubuntu-22.04
             nix_system: x86_64-linux
+            runner: Linux
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -331,7 +373,13 @@ jobs:
   # ── Coverage gate ─────────────────────────────────────────────────────────
   coverage:
     name: coverage (>80%)
-    runs-on: ubuntu-22.04
+    runs-on:
+      group: Default
+      labels:
+        - self-hosted
+        - Linux
+        - ARM64
+        - mac-server
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -362,7 +410,13 @@ jobs:
   # env setup is needed here.
   installer:
     name: installer script
-    runs-on: ubuntu-22.04
+    runs-on:
+      group: Default
+      labels:
+        - self-hosted
+        - Linux
+        - ARM64
+        - mac-server
     steps:
       - uses: actions/checkout@v4
 
@@ -388,7 +442,13 @@ jobs:
     name: CI passed
     if: always()
     needs: [lint, test, shell-integration, nix-flake, lifecycle, coverage, installer]
-    runs-on: ubuntu-22.04
+    runs-on:
+      group: Default
+      labels:
+        - self-hosted
+        - Linux
+        - ARM64
+        - mac-server
     steps:
       - name: verify every job succeeded
         run: |

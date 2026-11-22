@@ -23,7 +23,13 @@ jobs:
   # a hard failure rather than a warning.
   version:
     name: version gate
-    runs-on: ubuntu-22.04
+    runs-on:
+      group: Default
+      labels:
+        - self-hosted
+        - Linux
+        - ARM64
+        - mac-server
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
@@ -52,25 +58,35 @@ jobs:
 
   # ── Per-target build ───────────────────────────────────────────────────────
   #
-  # Every target has a native runner, so there is no cross toolchain, no linker
-  # config, and no --target flag: the host triple *is* the asset triple. The
-  # host assertion below keeps that assumption honest if a runner image changes.
+  # Fleet runners are all ARM64, so x86_64 assets are cross-compiled/emulated;
+  # the host-triple assertion below will fail for those entries until an
+  # x86_64 runner exists. The arm64 entries still build natively.
   build:
     name: build ${{ matrix.target }}
     needs: version
-    runs-on: ${{ matrix.os }}
+    runs-on:
+      group: Default
+      labels:
+        - self-hosted
+        - ${{ matrix.runner }}
+        - ARM64
+        - mac-server
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
+            runner: macOS
           - os: macos-15-intel
             target: x86_64-apple-darwin
+            runner: macOS
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            runner: Linux
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
+            runner: Linux
     steps:
       - uses: actions/checkout@v4
 
@@ -87,7 +103,7 @@ jobs:
           host="$(rustc -vV | sed -n 's/^host: //p')"
           echo "rustc host: $host"
           [ "$host" = "${{ matrix.target }}" ] \
-            || { echo "::error::runner ${{ matrix.os }} is $host, not ${{ matrix.target }}"; exit 1; }
+            || { echo "::error::runner ${{ matrix.runner }} is $host, not ${{ matrix.target }}"; exit 1; }
 
       - name: cargo build
         run: cargo build --release --locked
@@ -118,7 +134,13 @@ jobs:
   release:
     name: publish release
     needs: [version, build]
-    runs-on: ubuntu-22.04
+    runs-on:
+      group: Default
+      labels:
+        - self-hosted
+        - Linux
+        - ARM64
+        - mac-server
     permissions:
       contents: write
     steps:
