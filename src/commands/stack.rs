@@ -1496,10 +1496,8 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
                 "existing Skillshare Git source differs from the requested stack",
             ));
         }
-        // `origin` absent means the repo has never fetched — it is a fresh
-        // `init --git` or a partial bootstrap, both safe to realign later.
-        let bootstrap_owned = match git_output(&repo, &["remote", "get-url", "origin"]) {
-            Some(current) if current == remote => false,
+        match git_output(&repo, &["remote", "get-url", "origin"]) {
+            Some(current) if current == remote => {}
             Some(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
@@ -1507,11 +1505,8 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
                 ));
             }
             // Partial bootstrap: config exists but origin was never added.
-            None => {
-                git_run(&repo, &["remote", "add", "origin", remote])?;
-                true
-            }
-        };
+            None => git_run(&repo, &["remote", "add", "origin", remote])?,
+        }
         // A previous attempt may have failed before fetching, leaving no
         // stack locally. Materialize the remote default branch's content so
         // the retry can restore; established repos keep their local state.
@@ -1522,9 +1517,12 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
             .is_file()
         {
             fetch_skillshare_remote(&repo)?;
-            if let Some(branch) = remote_default_branch(&repo) {
-                align_branch_to_remote(&repo, &branch, bootstrap_owned)?;
-            }
+        }
+        // Realign whenever HEAD is still the scaffold commit — covers both
+        // fresh bootstraps and retries where a failed fetch left origin
+        // configured on a never-aligned repo.
+        if let Some(branch) = remote_default_branch(&repo) {
+            align_branch_to_remote(&repo, &branch)?;
         }
         return Ok(());
     }
@@ -1573,7 +1571,7 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
     // A fresh `init --git` repo has no commits in common with the remote;
     // path checkout alone leaves an orphan branch that can never push.
     if let Some(branch) = remote_default_branch(&repo) {
-        align_branch_to_remote(&repo, &branch, true)?;
+        align_branch_to_remote(&repo, &branch)?;
     }
     Ok(())
 }
@@ -1638,15 +1636,14 @@ fn remote_default_branch(repo: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Point the current branch at the fetched remote tip — but only when the
-/// repo is provably a fresh `skillshare init --git` scaffold: `origin` was
-/// absent before we added it, history is unrelated, and HEAD is the
-/// scaffold commit itself. Anything else keeps its commits; only the
-/// upstream tracking config is (re)set.
-fn align_branch_to_remote(repo: &Path, branch: &str, bootstrap_owned: bool) -> io::Result<()> {
+/// Point the current branch at the fetched remote tip — but only when HEAD
+/// is still the `skillshare init` scaffold commit: realigning anything else
+/// would orphan legitimate local history. The scaffold check alone is
+/// sufficient provenance, so this also repairs retries where a failed
+/// fetch left origin configured on a never-aligned repo.
+fn align_branch_to_remote(repo: &Path, branch: &str) -> io::Result<()> {
     let target = format!("origin/{branch}");
-    if bootstrap_owned
-        && git_output(repo, &["merge-base", "HEAD", target.as_str()]).is_none()
+    if git_output(repo, &["merge-base", "HEAD", target.as_str()]).is_none()
         && is_scaffold_head(repo)
     {
         git_run(repo, &["reset", "--soft", target.as_str()])?;
@@ -4779,6 +4776,149 @@ mod tests {
             "single legitimate commit must not be reset onto the remote"
         );
         assert!(local.join(".synapse/stack/stack.json").is_file());
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn ensure_skillshare_repository_realigns_after_failed_fetch_retry() {
+        let _lock = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tmpdir("skillshare-fetch-retry");
+        let config = temp.join("xdg").join("skillshare");
+        let local = config.clone();
+        let _git_bin = EnvGuard::set("SYNAPSE_GIT_BIN", Path::new("git"));
+        let _config_env = EnvGuard::set("SYNAPSE_SKILLSHARE_CONFIG", &config.join("config.yaml"));
+        let _author = EnvGuard::set_text("GIT_AUTHOR_NAME", "synapse-test");
+        let _aemail = EnvGuard::set_text("GIT_AUTHOR_EMAIL", "test@localhost");
+        let _cname = EnvGuard::set_text("GIT_COMMITTER_NAME", "synapse-test");
+        let _cemail = EnvGuard::set_text("GIT_COMMITTER_EMAIL", "test@localhost");
+
+        let git = |dir: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+
+        // Remote carries the captured stack.
+        let remote_work = temp.join("remote-work");
+        let remote = temp.join("remote.git");
+        fs::create_dir_all(remote_work.join(".synapse/stack")).unwrap();
+        fs::write(
+            remote_work.join(".synapse/stack/stack.json"),
+            "{\"version\":1}",
+        )
+        .unwrap();
+        fs::create_dir_all(remote_work.join("skills/remote-skill")).unwrap();
+        fs::write(
+            remote_work.join("skills/remote-skill/SKILL.md"),
+            "remote skill\n",
+        )
+        .unwrap();
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&remote_work)
+            .output()
+            .unwrap();
+        git(&remote_work, &["add", "-A"]);
+        git(&remote_work, &["commit", "-qm", "stack export"]);
+        let remote_str = remote.to_string_lossy().into_owned();
+        git(&remote_work, &["push", remote_str.as_str(), "HEAD:main"]);
+
+        // First attempt: origin added but fetch fails (remote unreachable).
+        // Simulate by pointing origin at a nonexistent path.
+        let bad_remote = temp
+            .join("does-not-exist.git")
+            .to_string_lossy()
+            .into_owned();
+        fs::create_dir_all(&config).unwrap();
+        fs::write(config.join("config.yaml"), "git_root: root\n").unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&local)
+            .output()
+            .unwrap();
+        fs::write(local.join(".gitignore"), "config.yaml\n.DS_Store\n").unwrap();
+        git(&local, &["add", "-A"]);
+        let output = Command::new("env")
+            .args([
+                "GIT_AUTHOR_NAME=skillshare",
+                "GIT_AUTHOR_EMAIL=skillshare@local",
+                "GIT_COMMITTER_NAME=skillshare",
+                "GIT_COMMITTER_EMAIL=skillshare@local",
+                "git",
+                "-C",
+            ])
+            .arg(&local)
+            .args(["commit", "-qm", "Initial skills"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        // ensure adds origin then fetch fails — origin stays configured.
+        git(&local, &["remote", "add", "origin", bad_remote.as_str()]);
+        assert!(
+            ensure_skillshare_repository(&bad_remote, "root").is_err()
+                || !local.join(".synapse/stack/stack.json").exists()
+        );
+
+        // Retry with the real remote: origin already matches? No — remote
+        // differs, so ensure errors AlreadyExists. Fix origin URL first.
+        git(
+            &local,
+            &["remote", "set-url", "origin", remote_str.as_str()],
+        );
+        // remote now matches requested; stack.json still missing → fetch+align.
+        ensure_skillshare_repository(&remote_str, "root").unwrap();
+
+        // HEAD must be the remote tip so a follow-up commit pushes cleanly.
+        let ancestor = Command::new("git")
+            .arg("-C")
+            .arg(&local)
+            .args(["merge-base", "--is-ancestor", "origin/main", "HEAD"])
+            .status()
+            .unwrap();
+        assert!(
+            ancestor.success(),
+            "origin/main must be ancestor after retry"
+        );
+        assert_eq!(
+            git(&local, &["rev-parse", "--abbrev-ref", "@{u}"]),
+            "origin/main"
+        );
+        assert!(local.join(".synapse/stack/stack.json").is_file());
+
+        // Capture round-trip: edit, commit, push fast-forwards.
+        fs::write(local.join("skills/remote-skill/SKILL.md"), "edited\n").unwrap();
+        git(&local, &["add", "-A"]);
+        git(&local, &["commit", "-qm", "local edit"]);
+        git(&local, &["push", "origin", "HEAD:main"]);
+        git(
+            &remote_work,
+            &["remote", "add", "origin", remote_str.as_str()],
+        );
+        git(&remote_work, &["fetch", "origin", "-q"]);
+        git(&remote_work, &["reset", "--hard", "origin/main"]);
+        assert_eq!(
+            fs::read_to_string(remote_work.join("skills/remote-skill/SKILL.md")).unwrap(),
+            "edited\n"
+        );
 
         fs::remove_dir_all(temp).ok();
     }
