@@ -1517,6 +1517,9 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
             .is_file()
         {
             fetch_skillshare_remote(&repo)?;
+            if let Some(branch) = remote_default_branch(&repo) {
+                align_branch_to_remote(&repo, &branch)?;
+            }
         }
         return Ok(());
     }
@@ -1562,6 +1565,11 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
     // Materialize the remote default branch so the captured stack is
     // actually present for the follow-up `stack restore --trust`.
     fetch_skillshare_remote(&repo)?;
+    // A fresh `init --git` repo has no commits in common with the remote;
+    // path checkout alone leaves an orphan branch that can never push.
+    if let Some(branch) = remote_default_branch(&repo) {
+        align_branch_to_remote(&repo, &branch)?;
+    }
     Ok(())
 }
 
@@ -1623,6 +1631,18 @@ fn remote_default_branch(repo: &Path) -> Option<String> {
         .and_then(|reference| reference.split_whitespace().next())
         .and_then(|reference| reference.strip_prefix("refs/heads/"))
         .map(str::to_string)
+}
+
+/// Point the current branch at the fetched remote tip when the histories
+/// share no commits — fresh `init --git` repos and partial bootstraps are
+/// orphan branches that path checkout alone can never push from. Repos
+/// with related history keep their own commits untouched.
+fn align_branch_to_remote(repo: &Path, branch: &str) -> io::Result<()> {
+    let target = format!("origin/{branch}");
+    if git_output(repo, &["merge-base", "HEAD", target.as_str()]).is_none() {
+        git_run(repo, &["reset", "--soft", target.as_str()])?;
+    }
+    git_run(repo, &["branch", "--set-upstream-to", target.as_str()])
 }
 
 fn git_run(repo: &Path, args: &[&str]) -> io::Result<()> {
@@ -3982,7 +4002,7 @@ mod tests {
                printf '.synapse\\nskills\\n'\n\
                exit 0\n\
              fi\n\
-             if [ \"$3\" = fetch ] || [ \"$3\" = checkout ]; then\n\
+             if [ \"$3\" = fetch ] || [ \"$3\" = checkout ] || [ \"$3\" = reset ] || [ \"$3\" = branch ]; then\n\
                exit 0\n\
              fi\n\
              exit 1\n",
@@ -4093,6 +4113,8 @@ mod tests {
                  mkdir -p \"$2/.synapse/stack\"\n\
                  : > \"$2/.synapse/stack/stack.json\"\n\
                  exit 0;;\n\
+              merge-base|reset|branch)\n\
+                exit 0;;\n\
              esac\n\
              exit 1\n",
         )
@@ -4134,7 +4156,9 @@ mod tests {
             "retry must materialize the remote stack, got:\n{git_log}"
         );
         assert!(
-            !git_log.contains("reset --hard") && !git_log.contains("merge"),
+            !git_log.contains("reset --hard")
+                && !git_log.contains(" merge ")
+                && !git_log.contains(" merge\n"),
             "remote sync must never rewrite history, got:\n{git_log}"
         );
         assert_eq!(
@@ -4412,6 +4436,134 @@ mod tests {
             "local: true\n"
         );
         assert!(!local.join(".synapse/stack/stack.json").exists());
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn ensure_skillshare_repository_aligns_fresh_branch_with_remote() {
+        let _lock = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tmpdir("skillshare-align");
+        let config = temp.join("xdg").join("skillshare");
+        let local = config.clone();
+        let _git_bin = EnvGuard::set("SYNAPSE_GIT_BIN", Path::new("git"));
+        let _config_env = EnvGuard::set("SYNAPSE_SKILLSHARE_CONFIG", &config.join("config.yaml"));
+        let _author = EnvGuard::set_text("GIT_AUTHOR_NAME", "synapse-test");
+        let _aemail = EnvGuard::set_text("GIT_AUTHOR_EMAIL", "test@localhost");
+        let _cname = EnvGuard::set_text("GIT_COMMITTER_NAME", "synapse-test");
+        let _cemail = EnvGuard::set_text("GIT_COMMITTER_EMAIL", "test@localhost");
+
+        let git = |dir: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+
+        // Remote default branch carries the captured stack and a skill.
+        let remote_work = temp.join("remote-work");
+        let remote = temp.join("remote.git");
+        fs::create_dir_all(remote_work.join(".synapse/stack")).unwrap();
+        fs::write(
+            remote_work.join(".synapse/stack/stack.json"),
+            "{\"version\":1}",
+        )
+        .unwrap();
+        fs::create_dir_all(remote_work.join("skills/remote-skill")).unwrap();
+        fs::write(
+            remote_work.join("skills/remote-skill/SKILL.md"),
+            "remote skill\n",
+        )
+        .unwrap();
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&remote_work)
+            .output()
+            .unwrap();
+        git(&remote_work, &["add", "-A"]);
+        git(&remote_work, &["commit", "-qm", "stack export"]);
+        let remote_str = remote.to_string_lossy().into_owned();
+        git(&remote_work, &["push", remote_str.as_str(), "HEAD:main"]);
+
+        // Fresh bootstrap state: config + repo whose only commit is the
+        // "Initial skills" scaffold skillshare init creates.
+        fs::create_dir_all(&config).unwrap();
+        fs::write(config.join("config.yaml"), "git_root: root\n").unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&local)
+            .output()
+            .unwrap();
+        fs::write(local.join(".gitignore"), "config.yaml\n").unwrap();
+        fs::create_dir_all(local.join("skills/initial")).unwrap();
+        fs::write(local.join("skills/initial/SKILL.md"), "initial\n").unwrap();
+        git(&local, &["add", "-A"]);
+        git(&local, &["commit", "-qm", "Initial skills"]);
+
+        ensure_skillshare_repository(&remote_str, "root").unwrap();
+
+        // Branch must sit on the remote tip so later capture/push fast-forwards.
+        let ancestor = Command::new("git")
+            .arg("-C")
+            .arg(&local)
+            .args(["merge-base", "--is-ancestor", "origin/main", "HEAD"])
+            .status()
+            .unwrap();
+        assert!(
+            ancestor.success(),
+            "origin/main must be an ancestor of HEAD"
+        );
+        assert_eq!(
+            git(&local, &["rev-list", "--count", "HEAD..origin/main"]),
+            "0"
+        );
+        assert_eq!(
+            git(&local, &["rev-parse", "--abbrev-ref", "@{u}"]),
+            "origin/main"
+        );
+        assert!(local.join(".synapse/stack/stack.json").is_file());
+        assert!(local.join("skills/remote-skill/SKILL.md").is_file());
+        // Scaffold files stay staged as additions; nothing remote-side is
+        // staged for deletion or modification.
+        let staged = git(&local, &["status", "--porcelain"]);
+        assert!(
+            !staged
+                .lines()
+                .any(|line| { line.contains(".synapse/") || line.contains("remote-skill") }),
+            "remote content must not be staged as a change, got:\n{staged}"
+        );
+
+        // A follow-up commit pushes cleanly — the capture round-trip.
+        fs::write(local.join("skills/remote-skill/SKILL.md"), "edited\n").unwrap();
+        git(&local, &["add", "-A"]);
+        git(&local, &["commit", "-qm", "local edit"]);
+        git(&local, &["push", "origin", "HEAD:main"]);
+        git(
+            &remote_work,
+            &["remote", "add", "origin", remote_str.as_str()],
+        );
+        git(&remote_work, &["fetch", "origin", "-q"]);
+        git(&remote_work, &["reset", "--hard", "origin/main"]);
+        assert_eq!(
+            fs::read_to_string(remote_work.join("skills/remote-skill/SKILL.md")).unwrap(),
+            "edited\n"
+        );
 
         fs::remove_dir_all(temp).ok();
     }
