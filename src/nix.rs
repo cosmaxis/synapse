@@ -124,6 +124,14 @@ pub fn resolve_bin() -> Option<String> {
         return Some("nix".to_string());
     }
 
+    // The single-user installer puts nix under ~/.nix-profile, which no
+    // absolute candidate covers and scheduler PATHs won't have.
+    if let Some(path) = crate::state::home_dir().map(|h| h.join(".nix-profile/bin/nix")) {
+        if path.is_file() {
+            return Some(path.to_string_lossy().into_owned());
+        }
+    }
+
     NIX_CANDIDATES
         .iter()
         .find(|p| std::path::Path::new(p).is_file())

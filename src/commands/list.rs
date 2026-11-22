@@ -28,7 +28,9 @@ pub fn run() -> io::Result<()> {
 
 pub(crate) fn format_timestamp(secs: u64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
-    let t = UNIX_EPOCH + Duration::from_secs(secs);
+    let Some(t) = UNIX_EPOCH.checked_add(Duration::from_secs(secs)) else {
+        return format!("{secs} (invalid timestamp)");
+    };
     // Simple ISO-8601 approximation without a time library dependency.
     // ponytail: swap for chrono/time if formatted timestamps matter; UNIX_EPOCH
     // offset arithmetic is enough for a readable list command.

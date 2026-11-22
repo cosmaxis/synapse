@@ -180,15 +180,19 @@ fn restore_inner(
     } else {
         None
     };
-    restore_from(&input, &manifest, force)?;
-    if let Some(secret_values) = secret_values {
-        let local = install_secret_environment(&secret_values)?;
+    // Secrets and shell config land BEFORE the stack is rewritten: if either
+    // fails, nothing has changed yet and the error is actionable instead of
+    // leaving a restored stack whose credentials never arrived.
+    if let Some(values) = &secret_values {
+        let local = install_secret_environment(values)?;
         println!(
             "Restored {} encrypted environment value(s) to {}; restart your shell to load them.",
-            secret_values.len(),
+            values.len(),
             local.display()
         );
-    } else if input.join(secrets::STACK_SECRETS_FILE).is_file() {
+    }
+    restore_from(&input, &manifest, force)?;
+    if secret_values.is_none() && input.join(secrets::STACK_SECRETS_FILE).is_file() {
         println!("Encrypted secrets are available; rerun with --with-secrets to restore them.");
     }
     println!("Restored AI stack from {}", input.display());
@@ -1461,12 +1465,24 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
     if !matches!(git_root, "root" | "skills" | "agents" | "extras") {
         return Err(invalid_input("invalid Skillshare git_root"));
     }
-    if let Some((_, current)) = skillshare_repository()? {
+    if let Some((repo, current)) = skillshare_repository()? {
         if current.remote != remote || current.git_root != git_root {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "existing Skillshare Git source differs from the requested stack",
             ));
+        }
+        // A previous init may have written config and origin but failed before
+        // fetching, leaving no stack locally. Materialize the remote default
+        // branch's stack so the retry can restore; established repos with a
+        // committed stack keep their local state untouched.
+        if !repo
+            .join(".synapse")
+            .join("stack")
+            .join(MANIFEST_FILE)
+            .is_file()
+        {
+            fetch_skillshare_remote(&repo)?;
         }
         return Ok(());
     }
@@ -1496,11 +1512,95 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
         ));
     }
     match skillshare_repository()? {
-        Some((_, current)) if current.remote == remote && current.git_root == git_root => Ok(()),
+        Some((repo, current)) if current.remote == remote && current.git_root == git_root => {
+            // `skillshare init --remote` writes config and an empty repository;
+            // it does not clone the remote. Materialize the remote default
+            // branch's stack so it is actually present for the follow-up
+            // `stack restore --trust`.
+            fetch_skillshare_remote(&repo)?;
+            Ok(())
+        }
         _ => Err(io::Error::other(
             "Skillshare initialization did not produce the requested Git source",
         )),
     }
+}
+
+/// Fetch the remote's default branch and materialize the captured stack into
+/// the worktree. History is never touched, so this is safe for boilerplate,
+/// established, and diverged repositories alike — no local work can be lost.
+fn fetch_skillshare_remote(repo: &Path) -> io::Result<()> {
+    git_run(repo, &["fetch", "origin"])?;
+    // ls-remote reports the remote's symbolic HEAD; an empty remote has no
+    // branch to restore, which the caller surfaces as a missing stack dir.
+    let Some(branch) = remote_default_branch(repo) else {
+        return Ok(());
+    };
+    let target = format!("origin/{branch}");
+    // cat-file keeps a stack-less remote a graceful no-op.
+    let manifest = format!("{target}:.synapse/stack/{MANIFEST_FILE}");
+    if git_exit(repo, &["cat-file", "-e", manifest.as_str()])? != 0 {
+        return Ok(());
+    }
+    git_run(repo, &["checkout", target.as_str(), "--", ".synapse/stack"])
+}
+
+fn remote_default_branch(repo: &Path) -> Option<String> {
+    git_output(repo, &["ls-remote", "--symref", "origin", "HEAD"])?
+        .lines()
+        .find_map(|line| line.strip_prefix("ref:"))
+        .and_then(|reference| reference.split_whitespace().next())
+        .and_then(|reference| reference.strip_prefix("refs/heads/"))
+        .map(str::to_string)
+}
+
+fn git_run(repo: &Path, args: &[&str]) -> io::Result<()> {
+    let git = env::var_os("SYNAPSE_GIT_BIN").unwrap_or_else(|| "git".into());
+    let status = Command::new(git)
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .status()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to run git {} in {}: {error}",
+                    args.join(" "),
+                    repo.display()
+                ),
+            )
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "git {} failed in {}",
+            args.join(" "),
+            repo.display()
+        )))
+    }
+}
+
+/// Exit code of a git invocation; spawn failures are the only errors.
+fn git_exit(repo: &Path, args: &[&str]) -> io::Result<i32> {
+    let git = env::var_os("SYNAPSE_GIT_BIN").unwrap_or_else(|| "git".into());
+    let status = Command::new(git)
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .status()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to run git {} in {}: {error}",
+                    args.join(" "),
+                    repo.display()
+                ),
+            )
+        })?;
+    Ok(status.code().unwrap_or(-1))
 }
 
 fn omp_command(profile: &str) -> Command {
@@ -2097,17 +2197,59 @@ fn resolve_secret_command(value: &str) -> io::Result<String> {
         ));
     }
     let command = value.trim_start_matches('!').trim_start();
-    let output = Command::new("sh")
+    // OMP resolves these with a bounded wait; mirror that so a resolver that
+    // blocks (e.g. `cat` on a FIFO) cannot hang capture forever.
+    const RESOLVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const MAX_RESOLVER_OUTPUT: u64 = 1024 * 1024;
+    let mut child = Command::new("sh")
         .arg("-c")
         .arg(command)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .map_err(|error| io::Error::new(error.kind(), "failed to resolve MCP secret command"))?;
-    if !output.status.success() {
+    // Drain stdout on a thread so a large-but-finite output cannot deadlock on
+    // a full pipe; the cap stops the read so the writer dies on EPIPE instead
+    // of exhausting memory.
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut limited = std::io::Read::take(&mut stdout, MAX_RESOLVER_OUTPUT);
+        let _ = std::io::Read::read_to_end(&mut limited, &mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + RESOLVER_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "MCP secret command timed out after 10s",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => {
+                break Err(io::Error::new(
+                    error.kind(),
+                    "failed to wait for MCP secret command",
+                ))
+            }
+        }
+    };
+    let buf = reader.join().unwrap_or_default();
+    let status = status?;
+    if !status.success() {
         return Err(invalid_data(
             "MCP secret command failed while capturing encrypted secrets",
         ));
     }
-    let value = String::from_utf8(output.stdout)
+    let value = String::from_utf8(buf)
         .map_err(|_| invalid_data("MCP secret command returned non-UTF-8 output"))?;
     Ok(value.trim_end_matches(['\r', '\n']).to_string())
 }
@@ -2137,8 +2279,11 @@ fn sanitize_env(
             })?
             .to_string();
         if current.starts_with('!') && secret_values.is_some() {
-            let variable = name.clone();
+            // Resolved command output is a server-scoped secret: namespace it
+            // like headers/auth so it cannot collide with a real env var of
+            // the same name on another server or in the user's shell.
             let resolved = resolve_secret_command(&current)?;
+            let variable = generated_variable(server_name, &["env", name]);
             record_secret_value(secret_values.as_deref_mut().unwrap(), &variable, resolved)?;
             *value = Value::String(variable.clone());
             required_env.insert(variable);
@@ -2150,15 +2295,34 @@ fn sanitize_env(
             }
             continue;
         }
+        // Already-portable manifests carry our own generated name back as the
+        // value. Treat it as an env reference so validation and recapture stay
+        // idempotent instead of storing the variable name as the secret.
+        let namespaced = generated_variable(server_name, &["env", name]);
+        if current == namespaced {
+            record_environment_value(&namespaced, required_env, secret_values.as_deref_mut())?;
+            continue;
+        }
         if current == *name {
             record_environment_value(name, required_env, secret_values.as_deref_mut())?;
             continue;
         }
 
-        let variable = name.clone();
-        record_secret_value_if_requested(secret_values.as_deref_mut(), &variable, current)?;
-        *value = Value::String(variable.clone());
-        required_env.insert(variable);
+        if let Some(secret_values) = secret_values.as_deref_mut() {
+            // Literal env values are server-scoped, not global: a server's
+            // PATH=/custom must not become `export PATH=...` in every shell,
+            // and two servers using the same env name must not share one
+            // snapshot slot. Namespace per server, matching headers/auth.
+            let variable = generated_variable(server_name, &["env", name]);
+            record_secret_value(secret_values, &variable, current)?;
+            *value = Value::String(variable.clone());
+            required_env.insert(variable);
+        } else {
+            // Without --with-secrets the literal cannot travel; keep the
+            // self-name reference so the value comes from the real env var.
+            *value = Value::String(name.clone());
+            required_env.insert(name.clone());
+        }
     }
     Ok(())
 }
@@ -2538,7 +2702,13 @@ fn reject_secret_value(server_name: &str, path: &mut Vec<String>, value: &Value)
                         .get(path.len().saturating_sub(2))
                         .map(String::as_str)
                         .unwrap_or_default();
-                    let env_reference = parent == "env" && text == name && valid_env_name(text);
+                    // Env values may reference the real variable (self-name)
+                    // or the server-scoped generated name secrets capture
+                    // writes; anything else literal is rejected.
+                    let env_reference = parent == "env"
+                        && valid_env_name(text)
+                        && (text == name
+                            || text == generated_variable(server_name, &["env", name]));
                     let authorization =
                         parent == "headers" && name.eq_ignore_ascii_case("Authorization");
                     if !env_reference
@@ -2841,7 +3011,11 @@ mod tests {
         assert!(!encoded.contains("auth-secret"));
         assert_eq!(
             portable["mcpServers"]["service"]["env"]["FROM_COMMAND"],
-            "FROM_COMMAND"
+            "SYNAPSE_MCP_SERVICE_ENV_FROM_COMMAND"
+        );
+        assert_eq!(
+            portable["mcpServers"]["service"]["env"]["PASSWORD"],
+            "SYNAPSE_MCP_SERVICE_ENV_PASSWORD"
         );
         assert_eq!(
             portable["mcpServers"]["service"]["headers"]["Authorization"],
@@ -2850,8 +3024,14 @@ mod tests {
         assert_eq!(
             values,
             BTreeMap::from([
-                ("FROM_COMMAND".to_string(), "command-secret".to_string()),
-                ("PASSWORD".to_string(), "literal-password".to_string()),
+                (
+                    "SYNAPSE_MCP_SERVICE_ENV_FROM_COMMAND".to_string(),
+                    "command-secret".to_string(),
+                ),
+                (
+                    "SYNAPSE_MCP_SERVICE_ENV_PASSWORD".to_string(),
+                    "literal-password".to_string(),
+                ),
                 (
                     "SYNAPSE_STACK_TEST_EXTERNAL".to_string(),
                     "external-secret".to_string(),
@@ -3263,7 +3443,10 @@ mod tests {
         let ciphertext = fs::read(output.join(secrets::STACK_SECRETS_FILE)).unwrap();
 
         assert_eq!(count, 1);
-        assert_eq!(manifest.omp_profiles[0].required_env, vec!["SERVICE_TOKEN"]);
+        assert_eq!(
+            manifest.omp_profiles[0].required_env,
+            vec!["SYNAPSE_MCP_SERVICE_ENV_SERVICE_TOKEN"]
+        );
         assert!(!ciphertext
             .windows(b"literal-secret".len())
             .any(|window| window == b"literal-secret"));
@@ -3273,7 +3456,10 @@ mod tests {
                 age::secrecy::SecretString::from("test passphrase".to_string()),
             )
             .unwrap(),
-            BTreeMap::from([("SERVICE_TOKEN".to_string(), "literal-secret".to_string())])
+            BTreeMap::from([(
+                "SYNAPSE_MCP_SERVICE_ENV_SERVICE_TOKEN".to_string(),
+                "literal-secret".to_string(),
+            )])
         );
 
         fs::remove_dir_all(temp).ok();
@@ -3296,6 +3482,9 @@ mod tests {
         let missing_skillshare = temp.join("missing-skillshare.yaml");
         const SECRET: &str = "synthetic e2e credential 'with quote'";
         const ENV_NAME: &str = "SYNAPSE_STACK_E2E_TOKEN";
+        // Env literals are server-scoped: the portable value and the
+        // secrets.env export use this generated name, not ENV_NAME.
+        const ENV_VAR: &str = "SYNAPSE_MCP_SYNTHETIC_ENV_SYNAPSE_STACK_E2E_TOKEN";
 
         fs::create_dir_all(source_omp.join("agent")).unwrap();
         fs::write(
@@ -3331,7 +3520,7 @@ mod tests {
             age::secrecy::SecretString::from("test passphrase".to_string()),
         )
         .unwrap();
-        assert_eq!(values[ENV_NAME], SECRET);
+        assert_eq!(values[ENV_VAR], SECRET);
 
         fs::create_dir_all(&target_home).unwrap();
         fs::write(target_home.join(".bashrc"), "# target shell\n").unwrap();
@@ -3350,14 +3539,14 @@ mod tests {
             read_json_optional(&target_omp.join("agent/mcp.json"))
                 .unwrap()
                 .unwrap()["mcpServers"]["synthetic"]["env"][ENV_NAME],
-            ENV_NAME
+            ENV_VAR
         );
         let output = Command::new("bash")
             .args([
                 "--noprofile",
                 "--norc",
                 "-c",
-                ". \"$1\"; printf '%s' \"$SYNAPSE_STACK_E2E_TOKEN\"",
+                ". \"$1\"; printf '%s' \"$SYNAPSE_MCP_SYNTHETIC_ENV_SYNAPSE_STACK_E2E_TOKEN\"",
                 "bash",
                 target_home.join(".bashrc").to_str().unwrap(),
             ])
@@ -3727,8 +3916,16 @@ mod tests {
         fs::write(
             &fake_git,
             "#!/bin/sh\n\
+             printf 'git %s\\n' \"$*\" >> \"$SYNAPSE_TEST_GIT_LOG\"\n\
              if [ \"$3\" = remote ] && [ \"$4\" = get-url ]; then\n\
                printf '%s\\n' \"$SYNAPSE_TEST_REMOTE\"\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$3\" = ls-remote ]; then\n\
+               printf 'ref: refs/heads/main\\tHEAD\\n0123456789abcdef0123456789abcdef01234567\\tHEAD\\n'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$3\" = fetch ] || [ \"$3\" = cat-file ] || [ \"$3\" = checkout ]; then\n\
                exit 0\n\
              fi\n\
              exit 1\n",
@@ -3741,6 +3938,8 @@ mod tests {
         let _skillshare = EnvGuard::set("SYNAPSE_SKILLSHARE_BIN", &fake_skillshare);
         let _git = EnvGuard::set("SYNAPSE_GIT_BIN", &fake_git);
         let _log = EnvGuard::set("SYNAPSE_TEST_LOG", &log);
+        let git_log = temp.join("git.log");
+        let _git_log = EnvGuard::set("SYNAPSE_TEST_GIT_LOG", &git_log);
         let _remote = EnvGuard::set("SYNAPSE_TEST_REMOTE", Path::new(remote));
         let manifest = StackManifest {
             version: STACK_VERSION,
@@ -3765,6 +3964,210 @@ mod tests {
                 "init --git-root root --remote {remote} --all-targets --no-copy --no-skill\n\
                  sync --all\n"
             )
+        );
+
+        // `skillshare init --remote` does not clone; ensure must fetch the
+        // remote default branch itself or the stack never arrives.
+        let git_log = fs::read_to_string(&git_log).unwrap();
+        for expected in [
+            "fetch origin",
+            "ls-remote --symref origin HEAD",
+            "checkout origin/main -- .synapse/stack",
+        ] {
+            assert!(
+                git_log.contains(expected),
+                "missing git {expected} in:\n{git_log}"
+            );
+        }
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn restore_remote_retries_fetch_after_failed_bootstrap() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tmpdir("skillshare-retry");
+        let config = temp.join("config");
+        let input = temp.join("stack");
+        let git_log = temp.join("git.log");
+        let state = temp.join("state");
+        let fake_skillshare = temp.join("skillshare-fake");
+        let fake_git = temp.join("git-fake");
+        let remote = "git@github.com:example/ai-stack.git";
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join("fail-fetch"), "").unwrap();
+        fs::write(
+            &fake_skillshare,
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"$SYNAPSE_TEST_LOG\"\n\
+             if [ \"$1\" = init ]; then\n\
+               mkdir -p \"$XDG_CONFIG_HOME/skillshare\"\n\
+               printf 'git_root: root\\n' > \"$XDG_CONFIG_HOME/skillshare/config.yaml\"\n\
+             fi\n",
+        )
+        .unwrap();
+        // fetch fails while the flag file exists; checkout simulates the
+        // remote content landing by materializing stack.json in the repo.
+        fs::write(
+            &fake_git,
+            "#!/bin/sh\n\
+             printf 'git %s\\n' \"$*\" >> \"$SYNAPSE_TEST_GIT_LOG\"\n\
+             case \"$3\" in\n\
+               remote)\n\
+                 if [ \"$4\" = get-url ]; then\n\
+                   printf '%s\\n' \"$SYNAPSE_TEST_REMOTE\"\n\
+                   exit 0\n\
+                 fi\n\
+                 exit 1;;\n\
+               fetch)\n\
+                 if [ -f \"$SYNAPSE_TEST_STATE/fail-fetch\" ]; then exit 1; fi\n\
+                 exit 0;;\n\
+               ls-remote)\n\
+                 printf 'ref: refs/heads/main\\tHEAD\\n0123456789abcdef0123456789abcdef01234567\\tHEAD\\n'\n\
+                 exit 0;;\n\
+               cat-file)\n\
+                 exit 0;;\n\
+               checkout)\n\
+                 mkdir -p \"$2/.synapse/stack\"\n\
+                 : > \"$2/.synapse/stack/stack.json\"\n\
+                 exit 0;;\n\
+             esac\n\
+             exit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_skillshare, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755)).unwrap();
+        let _config = EnvGuard::set("XDG_CONFIG_HOME", &config);
+        let _omp = EnvGuard::set("SYNAPSE_OMP_DIR", &temp.join("omp"));
+        let _skillshare = EnvGuard::set("SYNAPSE_SKILLSHARE_BIN", &fake_skillshare);
+        let _git = EnvGuard::set("SYNAPSE_GIT_BIN", &fake_git);
+        let _log = EnvGuard::set("SYNAPSE_TEST_LOG", &temp.join("skillshare.log"));
+        let _git_log = EnvGuard::set("SYNAPSE_TEST_GIT_LOG", &git_log);
+        let _state = EnvGuard::set("SYNAPSE_TEST_STATE", &state);
+        let _remote = EnvGuard::set("SYNAPSE_TEST_REMOTE", Path::new(remote));
+        let manifest = StackManifest {
+            version: STACK_VERSION,
+            omp_profiles: Vec::new(),
+            skillshare: Some(SkillshareSource {
+                remote: remote.into(),
+                git_root: "root".into(),
+            }),
+        };
+        write_json(&input.join(MANIFEST_FILE), &manifest).unwrap();
+
+        // First attempt: init persists config/origin, fetch fails.
+        assert!(restore(Some(&input), Some(remote), "root", false, false).is_err());
+
+        // Retry: the matching repo must fetch the remote default branch and
+        // materialize its stack into the worktree instead of returning early
+        // with nothing present.
+        fs::remove_file(state.join("fail-fetch")).unwrap();
+        restore(Some(&input), Some(remote), "root", true, false).unwrap();
+
+        let repo = config.join("skillshare");
+        assert!(repo.join(".synapse/stack/stack.json").is_file());
+        let git_log = fs::read_to_string(&git_log).unwrap();
+        assert!(
+            git_log.contains("checkout origin/main -- .synapse/stack"),
+            "retry must materialize the remote stack, got:\n{git_log}"
+        );
+        assert!(
+            !git_log.contains("reset --hard") && !git_log.contains("merge"),
+            "remote sync must never rewrite history, got:\n{git_log}"
+        );
+        assert_eq!(
+            git_log.matches("fetch origin").count(),
+            2,
+            "expected one failed and one successful fetch, got:\n{git_log}"
+        );
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn fetch_skillshare_remote_preserves_local_history() {
+        let _lock = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tmpdir("skillshare-preserve");
+        let _git_bin = EnvGuard::set_text("SYNAPSE_GIT_BIN", "git");
+        let _author = EnvGuard::set_text("GIT_AUTHOR_NAME", "synapse-test");
+        let _aemail = EnvGuard::set_text("GIT_AUTHOR_EMAIL", "test@localhost");
+        let _cname = EnvGuard::set_text("GIT_COMMITTER_NAME", "synapse-test");
+        let _cemail = EnvGuard::set_text("GIT_COMMITTER_EMAIL", "test@localhost");
+
+        let git = |dir: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        // Remote default branch carries the captured stack.
+        let remote_work = temp.join("remote-work");
+        let remote = temp.join("remote.git");
+        let local = temp.join("local");
+        fs::create_dir_all(remote_work.join(".synapse/stack")).unwrap();
+        fs::write(
+            remote_work.join(".synapse/stack/stack.json"),
+            "{\"version\":1}",
+        )
+        .unwrap();
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&remote_work)
+            .output()
+            .unwrap();
+        git(&remote_work, &["add", "-A"]);
+        git(&remote_work, &["commit", "-qm", "stack export"]);
+        let remote_str = remote.to_string_lossy().into_owned();
+        git(&remote_work, &["push", remote_str.as_str(), "HEAD:main"]);
+
+        // Local repo: unrelated "Initial skills" commit containing a real
+        // skill file — the case a hard reset would destroy.
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&local)
+            .output()
+            .unwrap();
+        fs::create_dir_all(local.join("skills/my-skill")).unwrap();
+        fs::write(local.join("skills/my-skill/SKILL.md"), "local skill\n").unwrap();
+        git(&local, &["add", "-A"]);
+        git(&local, &["commit", "-qm", "Initial skills"]);
+        git(&local, &["remote", "add", "origin", remote_str.as_str()]);
+
+        fetch_skillshare_remote(&local).unwrap();
+
+        // Stack materialized; local commit, skill file, and worktree intact.
+        assert!(local.join(".synapse/stack/stack.json").is_file());
+        assert_eq!(
+            git_output(&local, &["rev-list", "--count", "HEAD"]).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            git_output(&local, &["log", "-1", "--format=%s"]).as_deref(),
+            Some("Initial skills")
+        );
+        assert_eq!(
+            fs::read_to_string(local.join("skills/my-skill/SKILL.md")).unwrap(),
+            "local skill\n"
         );
 
         fs::remove_dir_all(temp).ok();

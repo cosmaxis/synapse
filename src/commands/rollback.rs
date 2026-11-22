@@ -10,6 +10,9 @@ use crate::state;
 /// recorded path is still present this is a re-point rather than a rebuild.
 pub fn run(package: Option<&str>) -> io::Result<()> {
     let cfg = state::config_dir();
+    // Lock before reading state so target selection and rollback_package's
+    // history mutation observe one consistent snapshot.
+    let _lock = state::acquire(&cfg).map_err(|e| io::Error::other(e.to_string()))?;
     let mut st = state::read(&cfg)?;
 
     if st.packages.is_empty() {
@@ -51,7 +54,6 @@ pub fn run(package: Option<&str>) -> io::Result<()> {
         println!("  {skipped}: no previous version, skipping");
     }
 
-    let _lock = state::acquire(&cfg).map_err(|e| io::Error::other(e.to_string()))?;
     let flake_dir = crate::commands::update::locate_flake_dir();
     let nix_bin = crate::nix::resolve_bin()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "nix not found"))?;
@@ -63,12 +65,22 @@ pub fn run(package: Option<&str>) -> io::Result<()> {
             .get(name)
             .and_then(|record| record.history.first().cloned())
             .expect("rollable implies non-empty history");
+        // The version being replaced — its store path is what undo restores
+        // if the profile transaction or the state write fails.
+        let prior_store_path = st
+            .packages
+            .get(name)
+            .and_then(|record| record.store_path.clone());
 
         let had_previous = match &target.store_path {
             Some(path) if Path::new(path).exists() => {
                 println!("  {name}: restoring profile path for {}", target.version);
                 match crate::commands::update::replace_profile_package(
-                    &nix_bin, name, path, &flake_dir,
+                    &nix_bin,
+                    name,
+                    path,
+                    &flake_dir,
+                    prior_store_path.as_deref(),
                 ) {
                     Ok(had_previous) => had_previous,
                     Err(error) => {
@@ -90,12 +102,24 @@ pub fn run(package: Option<&str>) -> io::Result<()> {
         };
 
         let Some((from, to)) = st.rollback_package(name) else {
-            let _ = crate::commands::update::undo_profile_replace(&nix_bin, name, had_previous);
+            let _ = crate::commands::update::undo_profile_replace(
+                &nix_bin,
+                name,
+                prior_store_path.as_deref(),
+                had_previous,
+                &flake_dir,
+            );
             return Err(io::Error::other("rollback state changed unexpectedly"));
         };
         if let Err(error) = state::write(&cfg, &st) {
-            let rollback =
-                crate::commands::update::undo_profile_replace(&nix_bin, name, had_previous).err();
+            let rollback = crate::commands::update::undo_profile_replace(
+                &nix_bin,
+                name,
+                prior_store_path.as_deref(),
+                had_previous,
+                &flake_dir,
+            )
+            .err();
             return Err(io::Error::new(
                 error.kind(),
                 match rollback {

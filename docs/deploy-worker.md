@@ -1,7 +1,10 @@
 # Deploying the install Worker
 
 `worker.js` serves the stable install URL: `https://synapse.cosmaxis.com/install`
-proxies `install.sh` from the latest release tag (falling back to `main`).
+serves a copy of `install.sh` bundled into the Worker at build time.
+
+`install.sh` changes do NOT reach users until the Worker is redeployed —
+`npx wrangler deploy` after any edit to `install.sh` (or `worker.js`).
 
 ## Deploy
 

@@ -10,3 +10,9 @@
 
 # Decrypted portable-secret material is always local-only.
 secrets.env
+
+# Wrangler local state — includes account credentials, never commit
+.wrangler/
+
+# Local tool caches produced by flake evals and CI scripts
+.cache/

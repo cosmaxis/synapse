@@ -1,10 +1,8 @@
 use std::io;
-use std::path::Path;
 
 use crate::nix;
 use crate::state;
-
-/// `synapse doctor` — diagnose PATH, symlinks, stale locks.
+/// `synapse doctor` — diagnose PATH and profile symlinks.
 pub fn run() -> io::Result<()> {
     let mut issues = 0usize;
 
@@ -34,34 +32,11 @@ pub fn run() -> io::Result<()> {
         }
     }
 
-    // 3. Stale lock file.
-    let lock_path = cfg.join(".lock");
-    if lock_path.exists() {
-        match std::fs::read_to_string(&lock_path) {
-            Ok(raw) => {
-                if let Ok(pid) = raw.trim().parse::<u32>() {
-                    if is_pid_running(pid) {
-                        println!("  ✓  lock file (PID {pid} is running)");
-                    } else {
-                        println!("  ⚠  stale lock file (PID {pid} is gone) — safe to delete");
-                        println!("     rm {}", lock_path.display());
-                        issues += 1;
-                    }
-                } else {
-                    println!("  ⚠  lock file unreadable — may be corrupt");
-                    issues += 1;
-                }
-            }
-            Err(e) => {
-                println!("  ⚠  could not read lock file: {e}");
-                issues += 1;
-            }
-        }
-    } else {
-        println!("  ✓  no lock file");
-    }
+    // `.lock` is a persistent flock inode — its existence is normal and
+    // probing it would require creating it, which violates doctor's
+    // lock-free contract. Contention surfaces on the next mutating command.
 
-    // 4. Broken symlinks in Nix profile (best-effort).
+    // 3. Broken symlinks in Nix profile (best-effort).
     check_nix_profile_symlinks(&mut issues);
 
     if issues == 0 {
@@ -81,21 +56,13 @@ fn which(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(unix)]
-fn is_pid_running(pid: u32) -> bool {
-    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(not(unix))]
-fn is_pid_running(_pid: u32) -> bool {
-    true
-}
-
 fn check_nix_profile_symlinks(issues: &mut usize) {
-    // Standard Nix single-user profile location.
-    let home = std::env::var("HOME").unwrap_or_default();
-    let profile_bin = Path::new(&home).join(".nix-profile/bin");
+    // Synapse installs into its own profile (honours SYNAPSE_PROFILE), not
+    // ~/.nix-profile — broken links there are what matter for synapse runs.
+    let Ok(profile) = crate::commands::update::synapse_profile() else {
+        return;
+    };
+    let profile_bin = profile.join("bin");
     if !profile_bin.exists() {
         return; // Nix profile not present — not necessarily an error here
     }

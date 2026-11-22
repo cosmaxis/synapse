@@ -20,7 +20,7 @@ pub fn run() -> io::Result<()> {
     println!("synapse {}", env!("CARGO_PKG_VERSION"));
     println!("commit:  {GIT_SHA}");
     println!("target:  {arch}-{os}");
-    println!("rustc:   {}", env!("CARGO_PKG_RUST_VERSION"));
+    println!("rust-version: {}", env!("CARGO_PKG_RUST_VERSION"));
 
     Ok(())
 }

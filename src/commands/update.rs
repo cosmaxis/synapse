@@ -8,6 +8,10 @@ use crate::tui::PACKAGES;
 /// `synapse update [package] [--all]`
 pub fn run(package: Option<&str>, all: bool) -> io::Result<()> {
     let cfg = state::config_dir();
+    // Lock before reading state: target selection and the final write must
+    // observe one consistent snapshot, or a concurrent uninstall's removal
+    // can be resurrected by the stale `st` written back below.
+    let _lock = state::acquire(&cfg).map_err(|e| io::Error::other(e.to_string()))?;
     let mut st = state::read(&cfg)?;
 
     if st.packages.is_empty() {
@@ -36,8 +40,6 @@ pub fn run(package: Option<&str>, all: bool) -> io::Result<()> {
     // back to the current directory (works for dev and installed layouts).
     let flake_dir = locate_flake_dir();
 
-    let _lock = state::acquire(&cfg).map_err(|e| io::Error::other(e.to_string()))?;
-
     let nix_bin = match crate::nix::resolve_bin() {
         Some(b) => b,
         None => {
@@ -51,6 +53,14 @@ pub fn run(package: Option<&str>, all: bool) -> io::Result<()> {
     for name in &targets {
         let pkg = PACKAGES.iter().find(|p| p.name == name);
         let nix_attr = pkg.map(|p| p.nix_attr).unwrap_or(name.as_str());
+        // The recorded store path lets a failed update reinstall the exact
+        // prior closure — one profile generation, this element only — instead
+        // of `nix profile rollback`, which is generation-relative and reverts
+        // every element to whatever that generation happened to contain.
+        let prior_store_path = st
+            .packages
+            .get(name)
+            .and_then(|record| record.store_path.clone());
 
         let old_version = st
             .packages
@@ -61,12 +71,19 @@ pub fn run(package: Option<&str>, all: bool) -> io::Result<()> {
         print!("  {name}: updating…");
         io::Write::flush(&mut io::stdout())?;
 
-        match build_package(nix_attr, &flake_dir, &nix_bin) {
+        match build_package(nix_attr, &flake_dir, &nix_bin, prior_store_path.as_deref()) {
             Ok((new_version, had_previous)) => {
                 let store_path = store_path_of(nix_attr, &flake_dir, &nix_bin);
                 st.set_package_with_path(name.clone(), new_version.clone(), store_path);
                 if let Err(error) = state::write(&cfg, &st) {
-                    let rollback = undo_profile_replace(&nix_bin, name, had_previous).err();
+                    let rollback = undo_profile_replace(
+                        &nix_bin,
+                        name,
+                        prior_store_path.as_deref(),
+                        had_previous,
+                        &flake_dir,
+                    )
+                    .err();
                     return Err(io::Error::new(
                         error.kind(),
                         match rollback {
@@ -138,6 +155,7 @@ pub fn replace_profile_package(
     name: &str,
     installable: &str,
     working_dir: &std::path::Path,
+    prior_store_path: Option<&str>,
 ) -> Result<bool, String> {
     let profile = synapse_profile()?;
     let parent = profile
@@ -170,14 +188,21 @@ pub fn replace_profile_package(
         Ok(status) => status,
         Err(error) => {
             if had_previous {
-                let _ = rollback_profile(nix_bin);
+                let _ = undo_profile_replace(
+                    nix_bin,
+                    name,
+                    prior_store_path,
+                    had_previous,
+                    working_dir,
+                );
             }
             return Err(format!("start nix profile install: {error}"));
         }
     };
     if !status.success() {
         if had_previous {
-            let _ = rollback_profile(nix_bin);
+            let _ =
+                undo_profile_replace(nix_bin, name, prior_store_path, had_previous, working_dir);
         }
         return Err(format!(
             "nix profile install exited {}",
@@ -186,10 +211,10 @@ pub fn replace_profile_package(
     }
 
     if !is_executable(&binary) {
-        let _ = rollback_profile(nix_bin);
-        if had_previous {
-            let _ = rollback_profile(nix_bin);
-        }
+        // Install succeeded but exposed no usable binary — undo covers both
+        // the fresh-install case (remove the stray element) and the update
+        // case (restore the prior closure).
+        let _ = undo_profile_replace(nix_bin, name, prior_store_path, had_previous, working_dir);
         return Err(format!(
             "profile install did not expose executable {}",
             binary.display()
@@ -247,7 +272,26 @@ fn rollback_profile(nix_bin: &str) -> Result<(), String> {
     }
 }
 
-pub fn undo_profile_replace(nix_bin: &str, name: &str, had_previous: bool) -> Result<(), String> {
+/// Undo a profile replace after a later step failed.
+///
+/// Prefers reinstalling the exact prior store path: one profile generation,
+/// touching only this element. `nix profile rollback` selects the numerically
+/// previous generation — not the pre-transaction one — so after another
+/// package's failed update it can land on that package's abandoned removal
+/// generation and silently uninstall it. Rollback remains only as a fallback
+/// for records that predate store-path tracking.
+pub fn undo_profile_replace(
+    nix_bin: &str,
+    name: &str,
+    prior_store_path: Option<&str>,
+    had_previous: bool,
+    working_dir: &std::path::Path,
+) -> Result<(), String> {
+    if let Some(path) = prior_store_path {
+        if std::path::Path::new(path).exists() {
+            return replace_profile_package(nix_bin, name, path, working_dir, None).map(|_| ());
+        }
+    }
     if had_previous {
         rollback_profile(nix_bin)?;
         rollback_profile(nix_bin)?;
@@ -264,7 +308,22 @@ pub fn undo_profile_replace(nix_bin: &str, name: &str, had_previous: bool) -> Re
     }
 }
 
-pub fn undo_profile_remove(nix_bin: &str, name: &str) -> Result<(), String> {
+/// Undo a profile element removal after a later step failed.
+///
+/// Same contract as [`undo_profile_replace`]: the recorded store path is
+/// reinstalled exactly; generation rollback is only the fallback for records
+/// that predate path tracking.
+pub fn undo_profile_remove(
+    nix_bin: &str,
+    name: &str,
+    prior_store_path: Option<&str>,
+    working_dir: &std::path::Path,
+) -> Result<(), String> {
+    if let Some(path) = prior_store_path {
+        if std::path::Path::new(path).exists() {
+            return replace_profile_package(nix_bin, name, path, working_dir, None).map(|_| ());
+        }
+    }
     rollback_profile(nix_bin)?;
     let binary = synapse_profile()?.join("bin").join(name);
     if is_executable(&binary) {
@@ -277,7 +336,7 @@ pub fn undo_profile_remove(nix_bin: &str, name: &str) -> Result<(), String> {
     }
 }
 
-fn is_executable(path: &std::path::Path) -> bool {
+pub(crate) fn is_executable(path: &std::path::Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
@@ -299,6 +358,7 @@ fn build_package(
     nix_attr: &str,
     flake_dir: &std::path::Path,
     nix_bin: &str,
+    prior_store_path: Option<&str>,
 ) -> Result<(String, bool), String> {
     let attr = flake_attr(flake_dir, nix_attr);
     let version_attr = flake_attr(flake_dir, &format!("{nix_attr}.version"));
@@ -311,6 +371,7 @@ fn build_package(
             "--raw",
             &version_attr,
             "--no-write-lock-file",
+            "--refresh",
         ])
         .current_dir(flake_dir)
         .output()
@@ -326,7 +387,8 @@ fn build_package(
         return Err("nix eval returned an empty package version".to_string());
     }
 
-    let had_previous = replace_profile_package(nix_bin, nix_attr, &attr, flake_dir)?;
+    let had_previous =
+        replace_profile_package(nix_bin, nix_attr, &attr, flake_dir, prior_store_path)?;
     Ok((version, had_previous))
 }
 
@@ -344,6 +406,7 @@ pub fn store_path_of(nix_attr: &str, flake_dir: &std::path::Path, nix_bin: &str)
             "path-info",
             &attr,
             "--no-write-lock-file",
+            "--refresh",
         ])
         .current_dir(flake_dir)
         .output()
@@ -563,7 +626,7 @@ mod tests {
         std::env::set_var("SYNAPSE_PROFILE", &profile);
 
         assert_eq!(
-            build_package("omp", &dir, fake_nix.to_str().unwrap())
+            build_package("omp", &dir, fake_nix.to_str().unwrap(), None)
                 .unwrap()
                 .0,
             "18.0.4"
@@ -620,7 +683,14 @@ mod tests {
         let previous_path = std::env::var_os("PATH");
         let previous_config = std::env::var_os("XDG_CONFIG_HOME");
         let previous_profile = std::env::var_os("SYNAPSE_PROFILE");
-        std::env::set_var("PATH", &dir);
+        // Prepend rather than replace: the fake nix shadows the real one for
+        // resolve_bin, while other PATH lookups (which, sh, …) keep working so
+        // concurrent tests that spawn subprocesses are unaffected.
+        let path_with_fake = match &previous_path {
+            Some(p) => format!("{}:{}", dir.display(), p.to_string_lossy()),
+            None => dir.display().to_string(),
+        };
+        std::env::set_var("PATH", path_with_fake);
         std::env::set_var("XDG_CONFIG_HOME", &config);
         std::env::set_var("SYNAPSE_PROFILE", &profile);
 

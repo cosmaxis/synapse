@@ -1,1 +1,1 @@
-{"name":"omp-nix","version":"1.0.0","dependencies":{"@oh-my-pi/pi-coding-agent":"18.1.21"},"overrides":{"adm-zip":"0.6.1","sharp":"0.35.4"}}
+{"name":"omp-nix","version":"1.0.0","dependencies":{"@oh-my-pi/pi-coding-agent":"19.1.0"},"overrides":{"adm-zip":"0.6.1","sharp":"0.35.4"}}
