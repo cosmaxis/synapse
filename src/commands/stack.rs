@@ -1496,16 +1496,10 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
                 "existing Skillshare Git source differs from the requested stack",
             ));
         }
-        // Remote-tracking refs prove the repo was fetched before; capture
-        // before `remote add`/`fetch` create any, so a repo that has never
-        // seen origin is distinguishable from an established one.
-        let had_origin_refs = git_output(
-            &repo,
-            &["for-each-ref", "--format=%(refname)", "refs/remotes/origin"],
-        )
-        .is_some_and(|refs| !refs.is_empty());
-        match git_output(&repo, &["remote", "get-url", "origin"]) {
-            Some(current) if current == remote => {}
+        // `origin` absent means the repo has never fetched — it is a fresh
+        // `init --git` or a partial bootstrap, both safe to realign later.
+        let bootstrap_owned = match git_output(&repo, &["remote", "get-url", "origin"]) {
+            Some(current) if current == remote => false,
             Some(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
@@ -1513,8 +1507,11 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
                 ));
             }
             // Partial bootstrap: config exists but origin was never added.
-            None => git_run(&repo, &["remote", "add", "origin", remote])?,
-        }
+            None => {
+                git_run(&repo, &["remote", "add", "origin", remote])?;
+                true
+            }
+        };
         // A previous attempt may have failed before fetching, leaving no
         // stack locally. Materialize the remote default branch's content so
         // the retry can restore; established repos keep their local state.
@@ -1526,7 +1523,7 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
         {
             fetch_skillshare_remote(&repo)?;
             if let Some(branch) = remote_default_branch(&repo) {
-                align_branch_to_remote(&repo, &branch, !had_origin_refs)?;
+                align_branch_to_remote(&repo, &branch, bootstrap_owned)?;
             }
         }
         return Ok(());
@@ -1641,20 +1638,38 @@ fn remote_default_branch(repo: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Point the current branch at the fetched remote tip — but only for repos
-/// that are provably bootstrap-owned: never fetched before, unrelated
-/// history, and a single scaffold commit. Anything else keeps its commits;
-/// only the upstream tracking config is (re)set.
+/// Point the current branch at the fetched remote tip — but only when the
+/// repo is provably a fresh `skillshare init --git` scaffold: `origin` was
+/// absent before we added it, history is unrelated, and HEAD is the
+/// scaffold commit itself. Anything else keeps its commits; only the
+/// upstream tracking config is (re)set.
 fn align_branch_to_remote(repo: &Path, branch: &str, bootstrap_owned: bool) -> io::Result<()> {
     let target = format!("origin/{branch}");
-    let orphan = bootstrap_owned
+    if bootstrap_owned
         && git_output(repo, &["merge-base", "HEAD", target.as_str()]).is_none()
-        && git_output(repo, &["rev-list", "--count", "HEAD"])
-            .is_some_and(|count| count.trim() == "1");
-    if orphan {
+        && is_scaffold_head(repo)
+    {
         git_run(repo, &["reset", "--soft", target.as_str()])?;
     }
     git_run(repo, &["branch", "--set-upstream-to", target.as_str()])
+}
+
+/// True when HEAD is the commit `skillshare init` creates: authored by
+/// skillshare, subject "Initial skills"/"Initial commit", tree holding
+/// only .gitignore. User commits never match all three.
+fn is_scaffold_head(repo: &Path) -> bool {
+    let Some(meta) = git_output(repo, &["show", "-s", "--format=%an%x1f%ae%x1f%s", "HEAD"]) else {
+        return false;
+    };
+    let mut parts = meta.split('\x1f');
+    let scaffold_meta = parts.next() == Some("skillshare")
+        && parts.next() == Some("skillshare@local")
+        && parts
+            .next()
+            .is_some_and(|subject| matches!(subject, "Initial skills" | "Initial commit"));
+    scaffold_meta
+        && git_output(repo, &["ls-tree", "-r", "--name-only", "HEAD"])
+            .is_some_and(|files| files == ".gitignore")
 }
 
 fn git_run(repo: &Path, args: &[&str]) -> io::Result<()> {
@@ -4525,11 +4540,23 @@ mod tests {
             .arg(&local)
             .output()
             .unwrap();
-        fs::write(local.join(".gitignore"), "config.yaml\n").unwrap();
-        fs::create_dir_all(local.join("skills/initial")).unwrap();
-        fs::write(local.join("skills/initial/SKILL.md"), "initial\n").unwrap();
+        // Match the real scaffold: only .gitignore, authored by skillshare.
+        fs::write(local.join(".gitignore"), "config.yaml\n.DS_Store\n").unwrap();
         git(&local, &["add", "-A"]);
-        git(&local, &["commit", "-qm", "Initial skills"]);
+        let output = Command::new("env")
+            .args([
+                "GIT_AUTHOR_NAME=skillshare",
+                "GIT_AUTHOR_EMAIL=skillshare@local",
+                "GIT_COMMITTER_NAME=skillshare",
+                "GIT_COMMITTER_EMAIL=skillshare@local",
+                "git",
+                "-C",
+            ])
+            .arg(&local)
+            .args(["commit", "-qm", "Initial skills"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
 
         ensure_skillshare_repository(&remote_str, "root").unwrap();
 
@@ -4669,6 +4696,89 @@ mod tests {
             git(&local, &["rev-parse", "--abbrev-ref", "@{u}"]),
             "origin/main"
         );
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn ensure_skillshare_repository_preserves_single_local_commit() {
+        let _lock = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tmpdir("skillshare-single-commit");
+        let config = temp.join("xdg").join("skillshare");
+        let local = config.clone();
+        let _git_bin = EnvGuard::set("SYNAPSE_GIT_BIN", Path::new("git"));
+        let _config_env = EnvGuard::set("SYNAPSE_SKILLSHARE_CONFIG", &config.join("config.yaml"));
+        let _author = EnvGuard::set_text("GIT_AUTHOR_NAME", "synapse-test");
+        let _aemail = EnvGuard::set_text("GIT_AUTHOR_EMAIL", "test@localhost");
+        let _cname = EnvGuard::set_text("GIT_COMMITTER_NAME", "synapse-test");
+        let _cemail = EnvGuard::set_text("GIT_COMMITTER_EMAIL", "test@localhost");
+
+        let git = |dir: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+
+        // Remote carries the captured stack.
+        let remote_work = temp.join("remote-work");
+        let remote = temp.join("remote.git");
+        fs::create_dir_all(remote_work.join(".synapse/stack")).unwrap();
+        fs::write(
+            remote_work.join(".synapse/stack/stack.json"),
+            "{\"version\":1}",
+        )
+        .unwrap();
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&remote_work)
+            .output()
+            .unwrap();
+        git(&remote_work, &["add", "-A"]);
+        git(&remote_work, &["commit", "-qm", "stack export"]);
+        let remote_str = remote.to_string_lossy().into_owned();
+        git(&remote_work, &["push", remote_str.as_str(), "HEAD:main"]);
+
+        // Existing repo: one legitimate local commit, no origin — must NOT
+        // be mistaken for a skillshare scaffold even though it is single.
+        fs::create_dir_all(&config).unwrap();
+        fs::write(config.join("config.yaml"), "git_root: root\n").unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&local)
+            .output()
+            .unwrap();
+        fs::write(local.join(".gitignore"), "config.yaml\n").unwrap();
+        fs::create_dir_all(local.join("skills/mine")).unwrap();
+        fs::write(local.join("skills/mine/SKILL.md"), "mine\n").unwrap();
+        git(&local, &["add", "-A"]);
+        git(&local, &["commit", "-qm", "my skill"]);
+        let local_head = git(&local, &["rev-parse", "HEAD"]);
+
+        ensure_skillshare_repository(&remote_str, "root").unwrap();
+
+        assert_eq!(
+            git(&local, &["rev-parse", "HEAD"]),
+            local_head,
+            "single legitimate commit must not be reset onto the remote"
+        );
+        assert!(local.join(".synapse/stack/stack.json").is_file());
 
         fs::remove_dir_all(temp).ok();
     }
