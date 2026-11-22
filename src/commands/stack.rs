@@ -1527,9 +1527,10 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
 }
 
 /// Fetch the remote's default branch into the Skillshare repository.
-/// `reset` is only for a freshly initialized repo (boilerplate only); retries
-/// against an existing repo merge instead so local commits are never lost.
-fn fetch_skillshare_remote(repo: &Path, reset: bool) -> io::Result<()> {
+/// `fresh` is only for a repo `skillshare init` just created (boilerplate
+/// only); an existing repo missing the stack gets a safe fast-forward or a
+/// loud refusal — never a reset that could discard local commits.
+fn fetch_skillshare_remote(repo: &Path, fresh: bool) -> io::Result<()> {
     git_run(repo, &["fetch", "origin"])?;
     // ls-remote reports the remote's symbolic HEAD; an empty remote has no
     // branch to restore, which the caller surfaces as a missing stack dir.
@@ -1537,11 +1538,29 @@ fn fetch_skillshare_remote(repo: &Path, reset: bool) -> io::Result<()> {
         return Ok(());
     };
     let target = format!("origin/{branch}");
-    if reset {
-        git_run(repo, &["reset", "--hard", target.as_str()])
-    } else {
-        git_run_merge(repo, &["merge", "--no-edit", target.as_str()])
+    if fresh {
+        return git_run(repo, &["reset", "--hard", target.as_str()]);
     }
+    // HEAD is an ancestor of the remote default: fast-forward, no merge
+    // commit and no author identity required.
+    if git_exit(
+        repo,
+        &["merge-base", "--is-ancestor", "HEAD", target.as_str()],
+    )? == 0
+    {
+        return git_run(repo, &["merge", "--ff-only", target.as_str()]);
+    }
+    // Unrelated histories can only be a just-initialized boilerplate repo;
+    // resetting it is lossless. Anything else is established local work the
+    // user must reconcile themselves.
+    let related = git_exit(repo, &["merge-base", "HEAD", target.as_str()])? == 0;
+    if !related && is_skillshare_boilerplate(repo) {
+        return git_run(repo, &["reset", "--hard", target.as_str()]);
+    }
+    Err(io::Error::other(format!(
+        "Skillshare repository at {} cannot fast-forward to {target}; resolve its history manually",
+        repo.display()
+    )))
 }
 
 fn remote_default_branch(repo: &Path) -> Option<String> {
@@ -1553,37 +1572,31 @@ fn remote_default_branch(repo: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A repo `skillshare init` just created holds a single "Initial skills"
+/// commit and no local work; resetting it to the remote is lossless.
+fn is_skillshare_boilerplate(repo: &Path) -> bool {
+    git_output(repo, &["rev-list", "--count", "HEAD"]).as_deref() == Some("1")
+        && git_output(repo, &["log", "-1", "--format=%s"]).as_deref() == Some("Initial skills")
+        && git_output(repo, &["status", "--porcelain"]).is_some_and(|out| out.is_empty())
+}
+
 fn git_run(repo: &Path, args: &[&str]) -> io::Result<()> {
-    git_run_full(repo, args, false)
-}
-
-/// Merge commits need an author identity; a fresh machine may have no git
-/// config, so supply one rather than failing the retry loop.
-fn git_run_merge(repo: &Path, args: &[&str]) -> io::Result<()> {
-    git_run_full(repo, args, true)
-}
-
-fn git_run_full(repo: &Path, args: &[&str], merge_identity: bool) -> io::Result<()> {
     let git = env::var_os("SYNAPSE_GIT_BIN").unwrap_or_else(|| "git".into());
-    let mut command = Command::new(git);
-    command.arg("-C").arg(repo).args(args);
-    if merge_identity {
-        command
-            .env("GIT_AUTHOR_NAME", "synapse")
-            .env("GIT_AUTHOR_EMAIL", "synapse@localhost")
-            .env("GIT_COMMITTER_NAME", "synapse")
-            .env("GIT_COMMITTER_EMAIL", "synapse@localhost");
-    }
-    let status = command.status().map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!(
-                "failed to run git {} in {}: {error}",
-                args.join(" "),
-                repo.display()
-            ),
-        )
-    })?;
+    let status = Command::new(git)
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .status()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to run git {} in {}: {error}",
+                    args.join(" "),
+                    repo.display()
+                ),
+            )
+        })?;
     if status.success() {
         Ok(())
     } else {
@@ -1593,6 +1606,27 @@ fn git_run_full(repo: &Path, args: &[&str], merge_identity: bool) -> io::Result<
             repo.display()
         )))
     }
+}
+
+/// Exit code of a git invocation; spawn failures are the only errors.
+fn git_exit(repo: &Path, args: &[&str]) -> io::Result<i32> {
+    let git = env::var_os("SYNAPSE_GIT_BIN").unwrap_or_else(|| "git".into());
+    let status = Command::new(git)
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .status()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to run git {} in {}: {error}",
+                    args.join(" "),
+                    repo.display()
+                ),
+            )
+        })?;
+    Ok(status.code().unwrap_or(-1))
 }
 
 fn omp_command(profile: &str) -> Command {
@@ -3917,7 +3951,7 @@ mod tests {
                printf 'ref: refs/heads/main\\tHEAD\\n0123456789abcdef0123456789abcdef01234567\\tHEAD\\n'\n\
                exit 0\n\
              fi\n\
-             if [ \"$3\" = fetch ] || [ \"$3\" = reset ] || [ \"$3\" = merge ]; then\n\
+             if [ \"$3\" = fetch ] || [ \"$3\" = reset ] || [ \"$3\" = merge ] || [ \"$3\" = merge-base ]; then\n\
                exit 0\n\
              fi\n\
              exit 1\n",
@@ -4021,6 +4055,16 @@ mod tests {
                ls-remote)\n\
                  printf 'ref: refs/heads/main\\tHEAD\\n0123456789abcdef0123456789abcdef01234567\\tHEAD\\n'\n\
                  exit 0;;\n\
+               merge-base)\n\
+                 exit 1;;\n\
+               rev-list)\n\
+                 printf '1\\n'\n\
+                 exit 0;;\n\
+               log)\n\
+                 printf 'Initial skills\\n'\n\
+                 exit 0;;\n\
+               status)\n\
+                 exit 0;;\n\
                reset|merge)\n\
                  mkdir -p \"$2/.synapse/stack\"\n\
                  : > \"$2/.synapse/stack/stack.json\"\n\
@@ -4052,8 +4096,9 @@ mod tests {
         // First attempt: init persists config/origin, fetch fails.
         assert!(restore(Some(&input), Some(remote), "root", false, false).is_err());
 
-        // Retry: the matching repo must fetch and merge the remote default
-        // branch instead of returning early with no stack present.
+        // Retry: the matching repo must fetch the remote default branch and
+        // reset the unrelated boilerplate history instead of returning early
+        // with no stack present.
         fs::remove_file(state.join("fail-fetch")).unwrap();
         restore(Some(&input), Some(remote), "root", true, false).unwrap();
 
@@ -4061,8 +4106,12 @@ mod tests {
         assert!(repo.join(".synapse/stack/stack.json").is_file());
         let git_log = fs::read_to_string(&git_log).unwrap();
         assert!(
-            git_log.contains("merge --no-edit origin/main"),
-            "retry must merge remote default branch, got:\n{git_log}"
+            git_log.contains("reset --hard origin/main"),
+            "unrelated boilerplate must reset to remote default, got:\n{git_log}"
+        );
+        assert!(
+            !git_log.contains("merge --no-edit"),
+            "unrelated histories must not be merged, got:\n{git_log}"
         );
         assert_eq!(
             git_log.matches("fetch origin").count(),
