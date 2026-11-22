@@ -1651,20 +1651,17 @@ fn align_branch_to_remote(repo: &Path, branch: &str) -> io::Result<()> {
     git_run(repo, &["branch", "--set-upstream-to", target.as_str()])
 }
 
-/// True when HEAD is the commit `skillshare init` creates: authored by
-/// skillshare, subject "Initial skills"/"Initial commit", tree holding
-/// only .gitignore. User commits never match all three.
+/// True when HEAD is the only commit a fresh `skillshare init --git` can
+/// produce: a root commit whose tree holds only .gitignore. Author and
+/// subject vary with the user's git config, so structure is the only
+/// reliable signal.
 fn is_scaffold_head(repo: &Path) -> bool {
-    let Some(meta) = git_output(repo, &["show", "-s", "--format=%an%x1f%ae%x1f%s", "HEAD"]) else {
-        return false;
-    };
-    let mut parts = meta.split('\x1f');
-    let scaffold_meta = parts.next() == Some("skillshare")
-        && parts.next() == Some("skillshare@local")
-        && parts
-            .next()
-            .is_some_and(|subject| matches!(subject, "Initial skills" | "Initial commit"));
-    scaffold_meta
+    let single =
+        git_output(repo, &["rev-list", "--count", "HEAD"]).is_some_and(|count| count.trim() == "1");
+    let root = git_output(repo, &["rev-list", "--max-parents=0", "HEAD"])
+        .is_some_and(|roots| !roots.is_empty());
+    single
+        && root
         && git_output(repo, &["ls-tree", "-r", "--name-only", "HEAD"])
             .is_some_and(|files| files == ".gitignore")
 }
@@ -4537,23 +4534,11 @@ mod tests {
             .arg(&local)
             .output()
             .unwrap();
-        // Match the real scaffold: only .gitignore, authored by skillshare.
+        // Match the real scaffold: only .gitignore, single root commit.
+        // Author is whatever the user's git config says — not skillshare.
         fs::write(local.join(".gitignore"), "config.yaml\n.DS_Store\n").unwrap();
         git(&local, &["add", "-A"]);
-        let output = Command::new("env")
-            .args([
-                "GIT_AUTHOR_NAME=skillshare",
-                "GIT_AUTHOR_EMAIL=skillshare@local",
-                "GIT_COMMITTER_NAME=skillshare",
-                "GIT_COMMITTER_EMAIL=skillshare@local",
-                "git",
-                "-C",
-            ])
-            .arg(&local)
-            .args(["commit", "-qm", "Initial skills"])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
+        git(&local, &["commit", "-qm", "Initial skills"]);
 
         ensure_skillshare_repository(&remote_str, "root").unwrap();
 
@@ -4856,20 +4841,7 @@ mod tests {
             .unwrap();
         fs::write(local.join(".gitignore"), "config.yaml\n.DS_Store\n").unwrap();
         git(&local, &["add", "-A"]);
-        let output = Command::new("env")
-            .args([
-                "GIT_AUTHOR_NAME=skillshare",
-                "GIT_AUTHOR_EMAIL=skillshare@local",
-                "GIT_COMMITTER_NAME=skillshare",
-                "GIT_COMMITTER_EMAIL=skillshare@local",
-                "git",
-                "-C",
-            ])
-            .arg(&local)
-            .args(["commit", "-qm", "Initial skills"])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
+        git(&local, &["commit", "-qm", "Initial skills"]);
 
         // ensure adds origin then fetch fails — origin stays configured.
         git(&local, &["remote", "add", "origin", bad_remote.as_str()]);
