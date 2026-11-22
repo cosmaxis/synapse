@@ -1444,6 +1444,21 @@ fn merge_mcp(existing: Option<&Value>, portable: &Value, force: bool) -> io::Res
 fn restore_skillshare(source: &SkillshareSource) -> io::Result<()> {
     ensure_skillshare_repository(&source.remote, &source.git_root)?;
     let binary = env::var_os("SYNAPSE_SKILLSHARE_BIN").unwrap_or_else(|| "skillshare".into());
+    // Targets are wired only here, after --trust: the pre-trust bootstrap
+    // runs `skillshare init --no-targets` so remote skills cannot sync into
+    // AI tools before review. Discover this machine's tools, then sync.
+    let status = Command::new(&binary)
+        .args(["init", "--discover"])
+        .status()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to start Skillshare target discovery: {error}"),
+            )
+        })?;
+    if !status.success() {
+        return Err(io::Error::other("Skillshare target discovery failed"));
+    }
     let status = Command::new(binary)
         .args(["sync", "--all"])
         .status()
@@ -1495,7 +1510,7 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
             git_root,
             "--remote",
             remote,
-            "--all-targets",
+            "--no-targets",
             "--no-copy",
             "--no-skill",
         ])
@@ -1585,11 +1600,11 @@ fn git_run(repo: &Path, args: &[&str]) -> io::Result<()> {
 /// Exit code of a git invocation; spawn failures are the only errors.
 fn git_exit(repo: &Path, args: &[&str]) -> io::Result<i32> {
     let git = env::var_os("SYNAPSE_GIT_BIN").unwrap_or_else(|| "git".into());
-    let status = Command::new(git)
+    let output = Command::new(git)
         .arg("-C")
         .arg(repo)
         .args(args)
-        .status()
+        .output()
         .map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -1600,7 +1615,7 @@ fn git_exit(repo: &Path, args: &[&str]) -> io::Result<i32> {
                 ),
             )
         })?;
-    Ok(status.code().unwrap_or(-1))
+    Ok(output.status.code().unwrap_or(-1))
 }
 
 fn omp_command(profile: &str) -> Command {
@@ -3954,14 +3969,15 @@ mod tests {
         restore(Some(&input), Some(remote), "root", false, false).unwrap();
         assert_eq!(
             fs::read_to_string(&log).unwrap(),
-            format!("init --git-root root --remote {remote} --all-targets --no-copy --no-skill\n")
+            format!("init --git-root root --remote {remote} --no-targets --no-copy --no-skill\n")
         );
 
         restore(Some(&input), None, "root", true, false).unwrap();
         assert_eq!(
             fs::read_to_string(log).unwrap(),
             format!(
-                "init --git-root root --remote {remote} --all-targets --no-copy --no-skill\n\
+                "init --git-root root --remote {remote} --no-targets --no-copy --no-skill\n\
+                 init --discover\n\
                  sync --all\n"
             )
         );
