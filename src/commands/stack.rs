@@ -1586,6 +1586,15 @@ fn fetch_skillshare_remote(repo: &Path) -> io::Result<()> {
     if tree.is_empty() {
         return Ok(());
     }
+    // Whole-tree checkout overwrites worktree files; refuse rather than
+    // destroy uncommitted or untracked local work before --trust consent.
+    // Committed work stays recoverable through HEAD.
+    let dirty = git_output(repo, &["status", "--porcelain"]).unwrap_or_default();
+    if !dirty.is_empty() {
+        return Err(io::Error::other(
+            "Skillshare repository has uncommitted changes; commit or stash them before restoring remote content",
+        ));
+    }
     git_run(repo, &["checkout", target.as_str(), "--", "."])
 }
 
@@ -4207,6 +4216,103 @@ mod tests {
             fs::read_to_string(local.join("agents/remote-agent.md")).unwrap(),
             "remote agent\n"
         );
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn fetch_skillshare_remote_refuses_uncommitted_changes() {
+        let _lock = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tmpdir("skillshare-dirty");
+        let _git_bin = EnvGuard::set_text("SYNAPSE_GIT_BIN", "git");
+        let _author = EnvGuard::set_text("GIT_AUTHOR_NAME", "synapse-test");
+        let _aemail = EnvGuard::set_text("GIT_AUTHOR_EMAIL", "test@localhost");
+        let _cname = EnvGuard::set_text("GIT_COMMITTER_NAME", "synapse-test");
+        let _cemail = EnvGuard::set_text("GIT_COMMITTER_EMAIL", "test@localhost");
+
+        let git = |dir: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        // Remote carries the captured stack and an agent file.
+        let remote_work = temp.join("remote-work");
+        let remote = temp.join("remote.git");
+        let local = temp.join("local");
+        fs::create_dir_all(remote_work.join(".synapse/stack")).unwrap();
+        fs::write(
+            remote_work.join(".synapse/stack/stack.json"),
+            "{\"version\":1}",
+        )
+        .unwrap();
+        fs::create_dir_all(remote_work.join("agents")).unwrap();
+        fs::write(remote_work.join("agents/remote-agent.md"), "remote agent\n").unwrap();
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&remote_work)
+            .output()
+            .unwrap();
+        git(&remote_work, &["add", "-A"]);
+        git(&remote_work, &["commit", "-qm", "stack export"]);
+        let remote_str = remote.to_string_lossy().into_owned();
+        git(&remote_work, &["push", remote_str.as_str(), "HEAD:main"]);
+
+        // Local repo with a committed skill, then an unstaged same-path edit.
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&local)
+            .output()
+            .unwrap();
+        fs::create_dir_all(local.join("skills/my-skill")).unwrap();
+        fs::write(local.join("skills/my-skill/SKILL.md"), "local skill\n").unwrap();
+        git(&local, &["add", "-A"]);
+        git(&local, &["commit", "-qm", "Initial skills"]);
+        git(&local, &["remote", "add", "origin", remote_str.as_str()]);
+        fs::write(local.join("skills/my-skill/SKILL.md"), "local edit\n").unwrap();
+
+        let error = fetch_skillshare_remote(&local).unwrap_err();
+        assert!(
+            error.to_string().contains("uncommitted"),
+            "expected refusal, got: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(local.join("skills/my-skill/SKILL.md")).unwrap(),
+            "local edit\n"
+        );
+        assert!(!local.join("agents/remote-agent.md").exists());
+
+        // Untracked file at a remote path is protected the same way.
+        git(&local, &["checkout", "--", "skills/my-skill/SKILL.md"]);
+        fs::create_dir_all(local.join("agents")).unwrap();
+        fs::write(local.join("agents/remote-agent.md"), "local agent\n").unwrap();
+
+        let error = fetch_skillshare_remote(&local).unwrap_err();
+        assert!(
+            error.to_string().contains("uncommitted"),
+            "expected refusal, got: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(local.join("agents/remote-agent.md")).unwrap(),
+            "local agent\n"
+        );
+        assert!(!local.join(".synapse/stack/stack.json").exists());
 
         fs::remove_dir_all(temp).ok();
     }
