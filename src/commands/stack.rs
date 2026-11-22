@@ -1652,10 +1652,16 @@ fn align_branch_to_remote(repo: &Path, branch: &str) -> io::Result<()> {
 }
 
 /// True when HEAD is the only commit a fresh `skillshare init --git` can
-/// produce: a root commit whose tree holds only .gitignore. Author and
-/// subject vary with the user's git config, so structure is the only
-/// reliable signal.
+/// produce: a single root commit whose tree holds only .gitignore, with
+/// config.yaml present in the worktree but not yet committed (init writes
+/// it after the scaffold commit). Author and subject vary with the user's
+/// git config, so structure plus the untracked config marker is the only
+/// reliable signal — a user's own .gitignore-only commit lacks config.yaml
+/// and is preserved.
 fn is_scaffold_head(repo: &Path) -> bool {
+    if !repo.join("config.yaml").is_file() {
+        return false;
+    }
     let single =
         git_output(repo, &["rev-list", "--count", "HEAD"]).is_some_and(|count| count.trim() == "1");
     let root = git_output(repo, &["rev-list", "--max-parents=0", "HEAD"])
@@ -4539,6 +4545,8 @@ mod tests {
         fs::write(local.join(".gitignore"), "config.yaml\n.DS_Store\n").unwrap();
         git(&local, &["add", "-A"]);
         git(&local, &["commit", "-qm", "Initial skills"]);
+        // init writes config.yaml after the scaffold commit — untracked.
+        fs::write(local.join("config.yaml"), "git_root: root\n").unwrap();
 
         ensure_skillshare_repository(&remote_str, "root").unwrap();
 
@@ -4766,6 +4774,96 @@ mod tests {
     }
 
     #[test]
+    fn ensure_skillshare_repository_preserves_gitignore_only_commit() {
+        let _lock = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tmpdir("skillshare-gitignore-only");
+        let config = temp.join("xdg").join("skillshare");
+        let local = config.clone();
+        let _git_bin = EnvGuard::set("SYNAPSE_GIT_BIN", Path::new("git"));
+        let _config_env = EnvGuard::set("SYNAPSE_SKILLSHARE_CONFIG", &config.join("config.yaml"));
+        let _author = EnvGuard::set_text("GIT_AUTHOR_NAME", "synapse-test");
+        let _aemail = EnvGuard::set_text("GIT_AUTHOR_EMAIL", "test@localhost");
+        let _cname = EnvGuard::set_text("GIT_COMMITTER_NAME", "synapse-test");
+        let _cemail = EnvGuard::set_text("GIT_COMMITTER_EMAIL", "test@localhost");
+
+        let git = |dir: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+
+        // Remote tracks .gitignore with content that differs from local.
+        let remote_work = temp.join("remote-work");
+        let remote = temp.join("remote.git");
+        fs::create_dir_all(remote_work.join(".synapse/stack")).unwrap();
+        fs::write(
+            remote_work.join(".synapse/stack/stack.json"),
+            "{\"version\":1}",
+        )
+        .unwrap();
+        fs::write(remote_work.join(".gitignore"), "remote-only\n").unwrap();
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&remote_work)
+            .output()
+            .unwrap();
+        git(&remote_work, &["add", "-A"]);
+        git(&remote_work, &["commit", "-qm", "stack export"]);
+        let remote_str = remote.to_string_lossy().into_owned();
+        git(&remote_work, &["push", remote_str.as_str(), "HEAD:main"]);
+
+        // User repo: single root commit, only .gitignore, no config.yaml —
+        // structurally identical to a scaffold but not one. Must be
+        // preserved: the differing remote .gitignore trips the dirty guard
+        // before any realignment.
+        fs::create_dir_all(&config).unwrap();
+        fs::write(config.join("config.yaml"), "git_root: root\n").unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&local)
+            .output()
+            .unwrap();
+        fs::write(local.join(".gitignore"), "user rules\n").unwrap();
+        git(&local, &["add", "-A"]);
+        git(&local, &["commit", "-qm", "my ignore rules"]);
+        let local_head = git(&local, &["rev-parse", "HEAD"]);
+
+        // No config.yaml marker → not a scaffold → no realignment. The
+        // committed .gitignore survives in HEAD even though checkout
+        // overwrites the worktree copy.
+        ensure_skillshare_repository(&remote_str, "root").unwrap();
+        assert_eq!(
+            git(&local, &["rev-parse", "HEAD"]),
+            local_head,
+            "user .gitignore-only commit must not be reset onto the remote"
+        );
+        assert_eq!(
+            git(&local, &["show", "HEAD:.gitignore"]),
+            "user rules",
+            "committed .gitignore content must survive"
+        );
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
     fn ensure_skillshare_repository_realigns_after_failed_fetch_retry() {
         let _lock = crate::test_utils::XDG_ENV_LOCK
             .lock()
@@ -4842,6 +4940,7 @@ mod tests {
         fs::write(local.join(".gitignore"), "config.yaml\n.DS_Store\n").unwrap();
         git(&local, &["add", "-A"]);
         git(&local, &["commit", "-qm", "Initial skills"]);
+        fs::write(local.join("config.yaml"), "git_root: root\n").unwrap();
 
         // ensure adds origin then fetch fails — origin stays configured.
         git(&local, &["remote", "add", "origin", bad_remote.as_str()]);
