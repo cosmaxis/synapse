@@ -918,7 +918,9 @@ fn excluded_snapshot_entry(name: &std::ffi::OsStr) -> bool {
     )
 }
 
-fn skillshare_repository() -> io::Result<Option<(PathBuf, SkillshareSource)>> {
+/// Resolve the Skillshare repo path and git_root from config.yaml without
+/// consulting git — used when origin may not exist yet.
+fn skillshare_config_location() -> io::Result<Option<(PathBuf, String)>> {
     let config_path = env::var_os("SYNAPSE_SKILLSHARE_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -957,6 +959,13 @@ fn skillshare_repository() -> io::Result<Option<(PathBuf, SkillshareSource)>> {
         "extras" => yaml_path(&config, "extras_source", config_dir)
             .unwrap_or_else(|| config_dir.join("extras")),
         _ => unreachable!(),
+    };
+    Ok(Some((repo, git_root)))
+}
+
+fn skillshare_repository() -> io::Result<Option<(PathBuf, SkillshareSource)>> {
+    let Some((repo, git_root)) = skillshare_config_location()? else {
+        return Ok(None);
     };
     let Some(remote) = git_output(&repo, &["remote", "get-url", "origin"]) else {
         return Ok(None);
@@ -1480,17 +1489,27 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
     if !matches!(git_root, "root" | "skills" | "agents" | "extras") {
         return Err(invalid_input("invalid Skillshare git_root"));
     }
-    if let Some((repo, current)) = skillshare_repository()? {
-        if current.remote != remote || current.git_root != git_root {
+    if let Some((repo, configured_root)) = skillshare_config_location()? {
+        if configured_root != git_root {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "existing Skillshare Git source differs from the requested stack",
             ));
         }
-        // A previous init may have written config and origin but failed before
-        // fetching, leaving no stack locally. Materialize the remote default
-        // branch's stack so the retry can restore; established repos with a
-        // committed stack keep their local state untouched.
+        match git_output(&repo, &["remote", "get-url", "origin"]) {
+            Some(current) if current == remote => {}
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "existing Skillshare Git source differs from the requested stack",
+                ));
+            }
+            // Partial bootstrap: config exists but origin was never added.
+            None => git_run(&repo, &["remote", "add", "origin", remote])?,
+        }
+        // A previous attempt may have failed before fetching, leaving no
+        // stack locally. Materialize the remote default branch's content so
+        // the retry can restore; established repos keep their local state.
         if !repo
             .join(".synapse")
             .join("stack")
@@ -1503,13 +1522,15 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
     }
 
     let binary = env::var_os("SYNAPSE_SKILLSHARE_BIN").unwrap_or_else(|| "skillshare".into());
+    // `--remote` would trigger skillshare's own pull/firstSync paths, which
+    // honor neither --git-root nor the pre-trust boundary. Initialize the
+    // repo ourselves and attach origin with plain git instead.
     let status = Command::new(binary)
         .args([
             "init",
+            "--git",
             "--git-root",
             git_root,
-            "--remote",
-            remote,
             "--no-targets",
             "--no-copy",
             "--no-skill",
@@ -1523,27 +1544,32 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
         })?;
     if !status.success() {
         return Err(io::Error::other(
-            "Skillshare could not clone or initialize its Git source",
+            "Skillshare could not initialize its Git source",
         ));
     }
-    match skillshare_repository()? {
-        Some((repo, current)) if current.remote == remote && current.git_root == git_root => {
-            // `skillshare init --remote` writes config and an empty repository;
-            // it does not clone the remote. Materialize the remote default
-            // branch's stack so it is actually present for the follow-up
-            // `stack restore --trust`.
-            fetch_skillshare_remote(&repo)?;
-            Ok(())
-        }
-        _ => Err(io::Error::other(
-            "Skillshare initialization did not produce the requested Git source",
-        )),
+    let Some((repo, configured_root)) = skillshare_config_location()? else {
+        return Err(io::Error::other(
+            "Skillshare initialization did not produce a config",
+        ));
+    };
+    if configured_root != git_root {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "existing Skillshare Git source differs from the requested stack",
+        ));
     }
+    git_run(&repo, &["remote", "add", "origin", remote])?;
+    // Materialize the remote default branch so the captured stack is
+    // actually present for the follow-up `stack restore --trust`.
+    fetch_skillshare_remote(&repo)?;
+    Ok(())
 }
 
-/// Fetch the remote's default branch and materialize the captured stack into
-/// the worktree. History is never touched, so this is safe for boilerplate,
-/// established, and diverged repositories alike — no local work can be lost.
+/// Fetch the remote's default branch and materialize its tree into the
+/// worktree — skills, agents, extras, and the captured stack alike, without
+/// depending on skillshare's hasSkills() pull heuristic. History is never
+/// touched, so this is safe for boilerplate, established, and diverged
+/// repositories alike — no local work can be lost.
 fn fetch_skillshare_remote(repo: &Path) -> io::Result<()> {
     git_run(repo, &["fetch", "origin"])?;
     // ls-remote reports the remote's symbolic HEAD; an empty remote has no
@@ -1552,12 +1578,24 @@ fn fetch_skillshare_remote(repo: &Path) -> io::Result<()> {
         return Ok(());
     };
     let target = format!("origin/{branch}");
-    // cat-file keeps a stack-less remote a graceful no-op.
-    let manifest = format!("{target}:.synapse/stack/{MANIFEST_FILE}");
-    if git_exit(repo, &["cat-file", "-e", manifest.as_str()])? != 0 {
+    // An empty remote tree is a graceful no-op; checkout of an empty tree
+    // would delete local files, so the guard is required.
+    let Some(tree) = git_output(repo, &["ls-tree", "--name-only", target.as_str()]) else {
+        return Ok(());
+    };
+    if tree.is_empty() {
         return Ok(());
     }
-    git_run(repo, &["checkout", target.as_str(), "--", ".synapse/stack"])
+    // Whole-tree checkout overwrites worktree files; refuse rather than
+    // destroy uncommitted or untracked local work before --trust consent.
+    // Committed work stays recoverable through HEAD.
+    let dirty = git_output(repo, &["status", "--porcelain"]).unwrap_or_default();
+    if !dirty.is_empty() {
+        return Err(io::Error::other(
+            "Skillshare repository has uncommitted changes; commit or stash them before restoring remote content",
+        ));
+    }
+    git_run(repo, &["checkout", target.as_str(), "--", "."])
 }
 
 fn remote_default_branch(repo: &Path) -> Option<String> {
@@ -1595,27 +1633,6 @@ fn git_run(repo: &Path, args: &[&str]) -> io::Result<()> {
             repo.display()
         )))
     }
-}
-
-/// Exit code of a git invocation; spawn failures are the only errors.
-fn git_exit(repo: &Path, args: &[&str]) -> io::Result<i32> {
-    let git = env::var_os("SYNAPSE_GIT_BIN").unwrap_or_else(|| "git".into());
-    let output = Command::new(git)
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "failed to run git {} in {}: {error}",
-                    args.join(" "),
-                    repo.display()
-                ),
-            )
-        })?;
-    Ok(output.status.code().unwrap_or(-1))
 }
 
 fn omp_command(profile: &str) -> Command {
@@ -3936,11 +3953,18 @@ mod tests {
                printf '%s\\n' \"$SYNAPSE_TEST_REMOTE\"\n\
                exit 0\n\
              fi\n\
+             if [ \"$3\" = remote ] && [ \"$4\" = add ]; then\n\
+               exit 0\n\
+             fi\n\
              if [ \"$3\" = ls-remote ]; then\n\
                printf 'ref: refs/heads/main\\tHEAD\\n0123456789abcdef0123456789abcdef01234567\\tHEAD\\n'\n\
                exit 0\n\
              fi\n\
-             if [ \"$3\" = fetch ] || [ \"$3\" = cat-file ] || [ \"$3\" = checkout ]; then\n\
+             if [ \"$3\" = ls-tree ]; then\n\
+               printf '.synapse\\nskills\\n'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$3\" = fetch ] || [ \"$3\" = checkout ]; then\n\
                exit 0\n\
              fi\n\
              exit 1\n",
@@ -3969,17 +3993,15 @@ mod tests {
         restore(Some(&input), Some(remote), "root", false, false).unwrap();
         assert_eq!(
             fs::read_to_string(&log).unwrap(),
-            format!("init --git-root root --remote {remote} --no-targets --no-copy --no-skill\n")
+            "init --git --git-root root --no-targets --no-copy --no-skill\n"
         );
 
         restore(Some(&input), None, "root", true, false).unwrap();
         assert_eq!(
             fs::read_to_string(log).unwrap(),
-            format!(
-                "init --git-root root --remote {remote} --no-targets --no-copy --no-skill\n\
-                 init --discover\n\
-                 sync --all\n"
-            )
+            "init --git --git-root root --no-targets --no-copy --no-skill\n\
+             init --discover\n\
+             sync --all\n"
         );
 
         // `skillshare init --remote` does not clone; ensure must fetch the
@@ -3988,7 +4010,7 @@ mod tests {
         for expected in [
             "fetch origin",
             "ls-remote --symref origin HEAD",
-            "checkout origin/main -- .synapse/stack",
+            "checkout origin/main -- .",
         ] {
             assert!(
                 git_log.contains(expected),
@@ -4033,20 +4055,22 @@ mod tests {
             "#!/bin/sh\n\
              printf 'git %s\\n' \"$*\" >> \"$SYNAPSE_TEST_GIT_LOG\"\n\
              case \"$3\" in\n\
-               remote)\n\
-                 if [ \"$4\" = get-url ]; then\n\
-                   printf '%s\\n' \"$SYNAPSE_TEST_REMOTE\"\n\
-                   exit 0\n\
-                 fi\n\
-                 exit 1;;\n\
-               fetch)\n\
-                 if [ -f \"$SYNAPSE_TEST_STATE/fail-fetch\" ]; then exit 1; fi\n\
-                 exit 0;;\n\
-               ls-remote)\n\
-                 printf 'ref: refs/heads/main\\tHEAD\\n0123456789abcdef0123456789abcdef01234567\\tHEAD\\n'\n\
-                 exit 0;;\n\
-               cat-file)\n\
-                 exit 0;;\n\
+              remote)\n\
+                if [ \"$4\" = get-url ]; then\n\
+                  printf '%s\\n' \"$SYNAPSE_TEST_REMOTE\"\n\
+                  exit 0\n\
+                fi\n\
+                if [ \"$4\" = add ]; then exit 0; fi\n\
+                exit 1;;\n\
+              fetch)\n\
+                if [ -f \"$SYNAPSE_TEST_STATE/fail-fetch\" ]; then exit 1; fi\n\
+                exit 0;;\n\
+              ls-remote)\n\
+                printf 'ref: refs/heads/main\\tHEAD\\n0123456789abcdef0123456789abcdef01234567\\tHEAD\\n'\n\
+                exit 0;;\n\
+              ls-tree)\n\
+                printf '.synapse\\nskills\\n'\n\
+                exit 0;;\n\
                checkout)\n\
                  mkdir -p \"$2/.synapse/stack\"\n\
                  : > \"$2/.synapse/stack/stack.json\"\n\
@@ -4088,7 +4112,7 @@ mod tests {
         assert!(repo.join(".synapse/stack/stack.json").is_file());
         let git_log = fs::read_to_string(&git_log).unwrap();
         assert!(
-            git_log.contains("checkout origin/main -- .synapse/stack"),
+            git_log.contains("checkout origin/main -- ."),
             "retry must materialize the remote stack, got:\n{git_log}"
         );
         assert!(
@@ -4141,6 +4165,8 @@ mod tests {
             "{\"version\":1}",
         )
         .unwrap();
+        fs::create_dir_all(remote_work.join("agents")).unwrap();
+        fs::write(remote_work.join("agents/remote-agent.md"), "remote agent\n").unwrap();
         Command::new("git")
             .args(["init", "--bare", "-b", "main"])
             .arg(&remote)
@@ -4185,6 +4211,108 @@ mod tests {
             fs::read_to_string(local.join("skills/my-skill/SKILL.md")).unwrap(),
             "local skill\n"
         );
+        // Whole-tree checkout also brings non-stack source content.
+        assert_eq!(
+            fs::read_to_string(local.join("agents/remote-agent.md")).unwrap(),
+            "remote agent\n"
+        );
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn fetch_skillshare_remote_refuses_uncommitted_changes() {
+        let _lock = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tmpdir("skillshare-dirty");
+        let _git_bin = EnvGuard::set_text("SYNAPSE_GIT_BIN", "git");
+        let _author = EnvGuard::set_text("GIT_AUTHOR_NAME", "synapse-test");
+        let _aemail = EnvGuard::set_text("GIT_AUTHOR_EMAIL", "test@localhost");
+        let _cname = EnvGuard::set_text("GIT_COMMITTER_NAME", "synapse-test");
+        let _cemail = EnvGuard::set_text("GIT_COMMITTER_EMAIL", "test@localhost");
+
+        let git = |dir: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        // Remote carries the captured stack and an agent file.
+        let remote_work = temp.join("remote-work");
+        let remote = temp.join("remote.git");
+        let local = temp.join("local");
+        fs::create_dir_all(remote_work.join(".synapse/stack")).unwrap();
+        fs::write(
+            remote_work.join(".synapse/stack/stack.json"),
+            "{\"version\":1}",
+        )
+        .unwrap();
+        fs::create_dir_all(remote_work.join("agents")).unwrap();
+        fs::write(remote_work.join("agents/remote-agent.md"), "remote agent\n").unwrap();
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&remote_work)
+            .output()
+            .unwrap();
+        git(&remote_work, &["add", "-A"]);
+        git(&remote_work, &["commit", "-qm", "stack export"]);
+        let remote_str = remote.to_string_lossy().into_owned();
+        git(&remote_work, &["push", remote_str.as_str(), "HEAD:main"]);
+
+        // Local repo with a committed skill, then an unstaged same-path edit.
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&local)
+            .output()
+            .unwrap();
+        fs::create_dir_all(local.join("skills/my-skill")).unwrap();
+        fs::write(local.join("skills/my-skill/SKILL.md"), "local skill\n").unwrap();
+        git(&local, &["add", "-A"]);
+        git(&local, &["commit", "-qm", "Initial skills"]);
+        git(&local, &["remote", "add", "origin", remote_str.as_str()]);
+        fs::write(local.join("skills/my-skill/SKILL.md"), "local edit\n").unwrap();
+
+        let error = fetch_skillshare_remote(&local).unwrap_err();
+        assert!(
+            error.to_string().contains("uncommitted"),
+            "expected refusal, got: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(local.join("skills/my-skill/SKILL.md")).unwrap(),
+            "local edit\n"
+        );
+        assert!(!local.join("agents/remote-agent.md").exists());
+
+        // Untracked file at a remote path is protected the same way.
+        git(&local, &["checkout", "--", "skills/my-skill/SKILL.md"]);
+        fs::create_dir_all(local.join("agents")).unwrap();
+        fs::write(local.join("agents/remote-agent.md"), "local agent\n").unwrap();
+
+        let error = fetch_skillshare_remote(&local).unwrap_err();
+        assert!(
+            error.to_string().contains("uncommitted"),
+            "expected refusal, got: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(local.join("agents/remote-agent.md")).unwrap(),
+            "local agent\n"
+        );
+        assert!(!local.join(".synapse/stack/stack.json").exists());
 
         fs::remove_dir_all(temp).ok();
     }
