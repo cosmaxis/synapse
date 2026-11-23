@@ -185,6 +185,8 @@ jobs:
       - name: clear stale nix installer state
         run: |
           sudo rm -f /etc/bash.bashrc.backup-before-nix \
+                     /etc/bashrc.backup-before-nix \
+                     /etc/profile.backup-before-nix \
                      /etc/zshrc.backup-before-nix \
                      /etc/zprofile.backup-before-nix \
                      /etc/zshenv.backup-before-nix
@@ -403,10 +405,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: install shellcheck and node
+      - name: install shellcheck and node 20
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck nodejs
+          sudo apt-get install -y -qq shellcheck curl ca-certificates gnupg
+          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+          sudo apt-get install -y -qq nodejs
 
       - name: posix syntax
         run: sh -n install.sh
