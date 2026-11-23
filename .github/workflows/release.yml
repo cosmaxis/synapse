@@ -217,42 +217,21 @@ jobs:
           [ "$count" = 4 ] || { echo "::error::expected 4 tarballs, found $count"; exit 1; }
           sha256sum -c checksums.txt
 
-      # Package versions come from the flake rather than being hardcoded here,
-      # so release notes always report the selected platform's package versions.
-      # Fleet runners may already have nix; the installer needs passwordless
-      # sudo for the nixbld group, which these runners lack — skip install when
-      # nix is already on PATH.
-      - name: check for nix
-        id: nixcheck
-        run: |
-          if command -v nix >/dev/null 2>&1; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-            nix --version
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: install single-user nix
-        if: steps.nixcheck.outputs.found != 'true'
-        run: |
-          set -euo pipefail
-          sh <(curl -fsSL https://nixos.org/nix/install) --no-daemon --yes
-          echo "$HOME/.nix-profile/bin" >> "$GITHUB_PATH"
-          # Single-user nix still reads experimental-features from nix.conf.
-          mkdir -p "$HOME/.config/nix"
-          printf 'experimental-features = nix-command flakes\naccept-flake-config = true\n' \
-            > "$HOME/.config/nix/nix.conf"
-
+      # Package versions are read from the same nix/*.nix files the flake
+      # packages — each carries a literal `version = "X"` attr that nix eval
+      # would return verbatim. Fleet runners have no nix and no passwordless
+      # sudo, so grep is the dependency-free equivalent.
       - name: release notes
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          # GITHUB_PATH additions apply to later steps, but be explicit anyway.
-          export PATH="$HOME/.nix-profile/bin:$PATH"
-          herdr="$(nix eval --raw '.#herdr.version')"
-          omp="$(nix eval --raw '.#omp.version')"
-          skillshare="$(nix eval --raw '.#skillshare.version')"
+          ver() { grep -m1 '^  version = "' "nix/$1.nix" | cut -d'"' -f2; }
+          herdr="$(ver herdr)"
+          omp="$(ver omp)"
+          skillshare="$(ver skillshare)"
+          [ -n "$herdr" ] && [ -n "$omp" ] && [ -n "$skillshare" ] \
+            || { echo "::error::failed to read managed package versions from nix/*.nix"; exit 1; }
 
           {
             echo "## Install"
