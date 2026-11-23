@@ -219,18 +219,37 @@ jobs:
 
       # Package versions come from the flake rather than being hardcoded here,
       # so release notes always report the selected platform's package versions.
-      - uses: cachix/install-nix-action@v27
-        with:
-          install_url: https://releases.nixos.org/nix/nix-2.24.10/install
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            accept-flake-config = true
+      # Fleet runners may already have nix; the installer needs passwordless
+      # sudo for the nixbld group, which these runners lack — skip install when
+      # nix is already on PATH.
+      - name: check for nix
+        id: nixcheck
+        run: |
+          if command -v nix >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            nix --version
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: install single-user nix
+        if: steps.nixcheck.outputs.found != 'true'
+        run: |
+          set -euo pipefail
+          sh <(curl -fsSL https://nixos.org/nix/install) --no-daemon --yes
+          echo "$HOME/.nix-profile/bin" >> "$GITHUB_PATH"
+          # Single-user nix still reads experimental-features from nix.conf.
+          mkdir -p "$HOME/.config/nix"
+          printf 'experimental-features = nix-command flakes\naccept-flake-config = true\n' \
+            > "$HOME/.config/nix/nix.conf"
 
       - name: release notes
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
+          # GITHUB_PATH additions apply to later steps, but be explicit anyway.
+          export PATH="$HOME/.nix-profile/bin:$PATH"
           herdr="$(nix eval --raw '.#herdr.version')"
           omp="$(nix eval --raw '.#omp.version')"
           skillshare="$(nix eval --raw '.#skillshare.version')"
