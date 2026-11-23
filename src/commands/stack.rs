@@ -1564,6 +1564,9 @@ fn ensure_skillshare_repository(remote: &str, git_root: &str) -> io::Result<()> 
             "existing Skillshare Git source differs from the requested stack",
         ));
     }
+    // Record the scaffold commit before fetch so realignment can prove
+    // provenance without trusting author or worktree markers.
+    record_bootstrap(&repo);
     git_run(&repo, &["remote", "add", "origin", remote])?;
     // Materialize the remote default branch so the captured stack is
     // actually present for the follow-up `stack restore --trust`.
@@ -1636,11 +1639,12 @@ fn remote_default_branch(repo: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Point the current branch at the fetched remote tip — but only when HEAD
-/// is still the `skillshare init` scaffold commit: realigning anything else
-/// would orphan legitimate local history. The scaffold check alone is
-/// sufficient provenance, so this also repairs retries where a failed
-/// fetch left origin configured on a never-aligned repo.
+/// Move HEAD onto the remote branch when it is still the scaffold commit —
+/// a fresh `init --git` repo shares no history with the remote, so a plain
+/// checkout would leave an orphan branch that can never push. Soft reset
+/// keeps the scaffold's worktree/index untouched (the remote tree is then
+/// checked out by fetch_skillshare_remote). Established repos keep their
+/// history.
 fn align_branch_to_remote(repo: &Path, branch: &str) -> io::Result<()> {
     let target = format!("origin/{branch}");
     if git_output(repo, &["merge-base", "HEAD", target.as_str()]).is_none()
@@ -1651,16 +1655,30 @@ fn align_branch_to_remote(repo: &Path, branch: &str) -> io::Result<()> {
     git_run(repo, &["branch", "--set-upstream-to", target.as_str()])
 }
 
-/// True when HEAD is the only commit a fresh `skillshare init --git` can
-/// produce: a single root commit whose tree holds only .gitignore, with
-/// config.yaml present in the worktree but not yet committed (init writes
-/// it after the scaffold commit). Author and subject vary with the user's
-/// git config, so structure plus the untracked config marker is the only
-/// reliable signal — a user's own .gitignore-only commit lacks config.yaml
-/// and is preserved.
+/// Ref recording the scaffold commit `skillshare init --git` creates, so
+/// realignment can distinguish bootstrap from a user's own history without
+/// relying on author, subject, or worktree markers (config.yaml lives
+/// outside the repo for non-root git_roots). Written right after init,
+/// before fetch; survives fetch and soft reset; never pushed.
+const BOOTSTRAP_REF: &str = "refs/synapse/bootstrap";
+
+/// Record HEAD as the bootstrap commit. Called once, right after
+/// `skillshare init --git` succeeds and before any fetch.
+fn record_bootstrap(repo: &Path) {
+    if let Some(head) = git_output(repo, &["rev-parse", "HEAD"]) {
+        let _ = git_run(repo, &["update-ref", BOOTSTRAP_REF, head.trim()]);
+    }
+}
+
+/// True when HEAD is still the recorded bootstrap commit. Falls back to a
+/// structural check for repos bootstrapped before the ref existed: a single
+/// root commit whose tree holds only .gitignore. The fallback can match a
+/// user's own .gitignore-only commit, but only for repos that predate the
+/// ref — new bootstraps always carry it.
 fn is_scaffold_head(repo: &Path) -> bool {
-    if !repo.join("config.yaml").is_file() {
-        return false;
+    if let Some(recorded) = git_output(repo, &["rev-parse", BOOTSTRAP_REF]) {
+        return git_output(repo, &["rev-parse", "HEAD"])
+            .is_some_and(|head| head.trim() == recorded.trim());
     }
     let single =
         git_output(repo, &["rev-list", "--count", "HEAD"]).is_some_and(|count| count.trim() == "1");
@@ -4545,6 +4563,9 @@ mod tests {
         fs::write(local.join(".gitignore"), "config.yaml\n.DS_Store\n").unwrap();
         git(&local, &["add", "-A"]);
         git(&local, &["commit", "-qm", "Initial skills"]);
+        // Production records the scaffold SHA in a ref right after init;
+        // mirror that so provenance doesn't fall back to structural checks.
+        record_bootstrap(&local);
         // init writes config.yaml after the scaffold commit — untracked.
         fs::write(local.join("config.yaml"), "git_root: root\n").unwrap();
 
@@ -4759,6 +4780,12 @@ mod tests {
         fs::write(local.join("skills/mine/SKILL.md"), "mine\n").unwrap();
         git(&local, &["add", "-A"]);
         git(&local, &["commit", "-qm", "my skill"]);
+        // A bootstrap ref recorded by an earlier scaffold, now diverged by
+        // the user's commit — provenance says "not scaffold" even though
+        // the repo is a single root commit.
+        git(&local, &["commit", "--allow-empty", "-qm", "marker"]);
+        git(&local, &["update-ref", BOOTSTRAP_REF, "HEAD"]);
+        git(&local, &["reset", "--hard", "HEAD~1"]);
         let local_head = git(&local, &["rev-parse", "HEAD"]);
 
         ensure_skillshare_repository(&remote_str, "root").unwrap();
@@ -4829,10 +4856,10 @@ mod tests {
         let remote_str = remote.to_string_lossy().into_owned();
         git(&remote_work, &["push", remote_str.as_str(), "HEAD:main"]);
 
-        // User repo: single root commit, only .gitignore, no config.yaml —
-        // structurally identical to a scaffold but not one. Must be
-        // preserved: the differing remote .gitignore trips the dirty guard
-        // before any realignment.
+        // User repo: single root commit whose tree holds only .gitignore —
+        // structurally identical to a scaffold. config.yaml must be ignored
+        // (as production .gitignore does) or `git add -A` would commit it
+        // and the fixture would no longer be .gitignore-only.
         fs::create_dir_all(&config).unwrap();
         fs::write(config.join("config.yaml"), "git_root: root\n").unwrap();
         Command::new("git")
@@ -4840,14 +4867,19 @@ mod tests {
             .arg(&local)
             .output()
             .unwrap();
-        fs::write(local.join(".gitignore"), "user rules\n").unwrap();
+        fs::write(local.join(".gitignore"), "config.yaml\nuser rules\n").unwrap();
         git(&local, &["add", "-A"]);
         git(&local, &["commit", "-qm", "my ignore rules"]);
+        // Give the repo a bootstrap ref that diverges from HEAD so the
+        // structural fallback can't mistake this commit for a scaffold.
+        git(&local, &["commit", "--allow-empty", "-qm", "marker"]);
+        git(&local, &["update-ref", BOOTSTRAP_REF, "HEAD"]);
+        git(&local, &["reset", "--hard", "HEAD~1"]);
         let local_head = git(&local, &["rev-parse", "HEAD"]);
 
-        // No config.yaml marker → not a scaffold → no realignment. The
-        // committed .gitignore survives in HEAD even though checkout
-        // overwrites the worktree copy.
+        // Ref mismatch → not a scaffold → no realignment. The committed
+        // .gitignore survives in HEAD even though checkout overwrites the
+        // worktree copy.
         ensure_skillshare_repository(&remote_str, "root").unwrap();
         assert_eq!(
             git(&local, &["rev-parse", "HEAD"]),
@@ -4856,7 +4888,7 @@ mod tests {
         );
         assert_eq!(
             git(&local, &["show", "HEAD:.gitignore"]),
-            "user rules",
+            "config.yaml\nuser rules",
             "committed .gitignore content must survive"
         );
 
@@ -4940,6 +4972,9 @@ mod tests {
         fs::write(local.join(".gitignore"), "config.yaml\n.DS_Store\n").unwrap();
         git(&local, &["add", "-A"]);
         git(&local, &["commit", "-qm", "Initial skills"]);
+        // Mirror production: the bootstrap ref is recorded at init time,
+        // before the first (failing) fetch.
+        record_bootstrap(&local);
         fs::write(local.join("config.yaml"), "git_root: root\n").unwrap();
 
         // ensure adds origin then fetch fails — origin stays configured.
