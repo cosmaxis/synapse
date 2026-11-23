@@ -237,40 +237,42 @@ code, it is decoration — delete it.
 
 ## CI
 
-`.github/workflows/ci.yml` owns the single required `ci-passed` check.
+`.github/workflows/ci.yml` owns the single required `ci-passed` check. All
+jobs run on the self-hosted ARM64 fleet; x86_64 support was dropped, so every
+matrix carries only the two native aarch64 legs (macOS + Linux).
 
 | Job | Covers |
 |---|---|
 | lint | clippy `--all-targets -D warnings` |
-| test | build + tests on 4 platforms, asserts arch in `version` output |
-| shell-integration | bash/zsh/fish rc generation, macOS + Linux |
-| nix-flake | flake builds per system, binaries run. **The platform proof.** |
+| test | build + tests on aarch64 macOS + Linux, asserts arch in `version` output |
+| shell-integration | bash/zsh/fish rc generation, Linux aarch64 |
+| nix-flake | flake builds for aarch64-darwin + aarch64-linux, binaries run. **The platform proof.** |
 | lifecycle | install/update/rollback/uninstall, needs `nix-flake` |
 | coverage | 80% floor, excludes `tui.rs`/`main.rs`/`build.rs` (need a pty harness) |
 | installer | `sh -n`, shellcheck, `ci/install-check.sh` |
 
 `.github/workflows/release.yml` triggers on `v*` tags. `version` gate fails the
 build if the tag disagrees with `Cargo.toml` — a mismatched tag would publish
-assets the installer cannot resolve. All four build legs run on the
-self-hosted ARM64 fleet (`mac-server` labels); the two x86_64 targets
-cross-compile — `x86_64-apple-darwin` via `rustup target add` + clang on the
-macOS fleet, `x86_64-unknown-linux-gnu` via `cargo-zigbuild` (`.2.35` glibc
-baseline) on the Linux fleet. GitHub-hosted runners are deliberately unused:
-the hosted pool starved every release ~8h until auto-cancel (through v1.2.13).
-Then collect, checksum, and publish. `contents: write` is scoped to the
-release job only; release notes read managed-package versions by grepping the
-literal `version` attr in `nix/*.nix` (fleet runners have no nix/sudo).
+assets the installer cannot resolve. Both build legs run natively on the
+self-hosted ARM64 fleet (`mac-server` labels): `aarch64-apple-darwin` on the
+macOS fleet, `aarch64-unknown-linux-gnu` on the Linux fleet. x86_64 support
+was dropped after v1.2.14. GitHub-hosted runners are deliberately unused:
+the hosted pool starved every release ~8h until auto-cancel. Then collect,
+checksum (expects exactly 2 tarballs), and publish. `contents: write` is
+scoped to the release job only; release notes read managed-package versions
+by grepping the literal `version` attr in `nix/*.nix`.
 
 ---
 
 ## Release status
 
 **v1.2.14 is the current release** (tagged 2026-11-23): first fully
-self-hosted release — all four assets built on the fleet via cross-compile,
-published with checksums. Earlier tags ≤ v1.2.13 never published
-(hosted-runner starvation); the `v1.2.13` tag remains on the remote with no
-release. Encrypted portable-secret sync remains unreleased until it has its
-own CI, tag, assets, and bootstrap proof.
+self-hosted release — all four assets built on the fleet (x86_64 legs
+cross-compiled), published with checksums. It is also the last release with
+x86_64 assets; x86_64 support was dropped afterwards. Earlier tags ≤ v1.2.13
+never published (hosted-runner starvation); the `v1.2.13` tag remains on the
+remote with no release. Encrypted portable-secret sync remains unreleased
+until it has its own CI, tag, assets, and bootstrap proof.
 
 ---
 

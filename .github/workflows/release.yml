@@ -58,10 +58,9 @@ jobs:
 
   # ── Per-target build ───────────────────────────────────────────────────────
   #
-  # All four legs run on the self-hosted ARM64 fleet; the two x86_64 targets
-  # cross-compile (macOS via rustup target + clang, Linux via cargo-zigbuild).
-  # GitHub-hosted runners are deliberately unused: the hosted pool starved
-  # every release for ~8h until GitHub auto-cancelled the queued jobs.
+  # x86_64 support was dropped; both legs build natively on the self-hosted
+  # ARM64 fleet. GitHub-hosted runners are deliberately unused: the hosted
+  # pool starved every release for ~8h until GitHub auto-cancelled the jobs.
   build:
     name: build ${{ matrix.target }}
     needs: version
@@ -74,19 +73,9 @@ jobs:
             target: aarch64-apple-darwin
             runner: macOS
             runs_on: '{"group":"Default","labels":["self-hosted","macOS","ARM64","mac-server"]}'
-          - os: macos-15
-            target: x86_64-apple-darwin
-            runner: macOS
-            cross: true
-            runs_on: '{"group":"Default","labels":["self-hosted","macOS","ARM64","mac-server"]}'
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             runner: Linux
-            runs_on: '{"group":"Default","labels":["self-hosted","Linux","ARM64","mac-server"]}'
-          - os: ubuntu-22.04-arm
-            target: x86_64-unknown-linux-gnu
-            runner: Linux
-            cross: true
             runs_on: '{"group":"Default","labels":["self-hosted","Linux","ARM64","mac-server"]}'
     steps:
       - uses: actions/checkout@v4
@@ -97,58 +86,17 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      - name: runner host triple is aarch64 for this target's OS
+      - name: runner host triple matches the asset triple
         shell: bash
         run: |
           set -euo pipefail
           host="$(rustc -vV | sed -n 's/^host: //p')"
-          echo "rustc host: $host; target: ${{ matrix.target }}"
-          case "${{ matrix.target }}" in
-            *-apple-darwin|*-unknown-linux-*)
-              [ "${host%%-*}" = "aarch64" ] ;;
-            *) exit 1 ;;
-          esac
-
-      - name: zig + cargo-zigbuild for Linux x86_64 cross
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: |
-          set -euo pipefail
-          # Fleet runners are persistent: this installs once, later runs skip.
-          command -v cargo-zigbuild >/dev/null \
-            || cargo install cargo-zigbuild --locked
-          if ! command -v zig >/dev/null; then
-            # Pinned stable release; index.json carries per-platform tarball
-            # URL + shasum. master entries are dev builds under /builds/ — do
-            # not consume them.
-            zig_json="$(curl -fsSL https://ziglang.org/download/index.json)"
-            zig_meta="$(printf '%s' "$zig_json" | python3 -c 'import json,sys; e=json.load(sys.stdin)["0.15.2"]["aarch64-linux"]; print(e["tarball"], e["shasum"])')"
-            zig_url="$(printf '%s' "$zig_meta" | cut -d' ' -f1)"
-            zig_sum="$(printf '%s' "$zig_meta" | cut -d' ' -f2)"
-            curl -fsSL "$zig_url" -o /tmp/zig.tar.xz
-            echo "$zig_sum  /tmp/zig.tar.xz" | shasum -a 256 -c -
-            mkdir -p "$HOME/.local/zig"
-            tar -xJf /tmp/zig.tar.xz -C "$HOME/.local/zig" --strip-components=1
-            rm /tmp/zig.tar.xz
-            echo "$HOME/.local/zig" >> "$GITHUB_PATH"
-          fi
-          rustup target add x86_64-unknown-linux-gnu
-
-      - name: rust target for macOS x86_64 cross
-        if: matrix.target == 'x86_64-apple-darwin'
-        run: rustup target add x86_64-apple-darwin
+          echo "rustc host: $host"
+          [ "$host" = "${{ matrix.target }}" ] \
+            || { echo "::error::runner ${{ matrix.runner }} is $host, not ${{ matrix.target }}"; exit 1; }
 
       - name: cargo build
-        env:
-          CARGO_BUILD_TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
-            # .2.35 keeps the glibc baseline identical to the old ubuntu-22.04
-            # hosted build; zig supplies the cross libc and linker.
-            cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.35
-          else
-            cargo build --release --locked --target "${{ matrix.target }}"
-          fi
+        run: cargo build --release --locked
 
       - name: package
         shell: bash
@@ -157,20 +105,13 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          # --target puts the binary under target/<triple>/release.
-          bin="$(find target -path '*/release/synapse' -type f | head -1)"
-          [ -n "$bin" ] || { echo "::error::synapse binary not found under target/"; exit 1; }
-          # llvm-strip handles foreign-arch binaries where binutils strip may not.
-          if command -v llvm-strip >/dev/null; then
-            strip_bin=llvm-strip
-          else
-            rustup component add llvm-tools >/dev/null
-            strip_bin="$(find "$(rustc --print sysroot)" -name llvm-strip -type f | head -1)"
-          fi
-          "${strip_bin:-strip}" -x "$bin"
+          bin="target/release/synapse"
+          [ -f "$bin" ] || { echo "::error::synapse binary not found"; exit 1; }
+          # -x keeps the strip portable across GNU binutils and cctools.
+          strip -x "$bin"
           tarball="synapse-${VERSION}-${TARGET}.tar.gz"
           # -C means the archive holds exactly one member, `synapse`, at root.
-          tar -czf "$tarball" -C "$(dirname "$bin")" synapse
+          tar -czf "$tarball" -C target/release synapse
           tar -tzf "$tarball"
           ls -lh "$tarball"
           echo "TARBALL=$tarball" >> "$GITHUB_ENV"
@@ -214,13 +155,12 @@ jobs:
           sha256sum synapse-*.tar.gz > checksums.txt
           cat checksums.txt
           count="$(wc -l < checksums.txt | tr -d ' ')"
-          [ "$count" = 4 ] || { echo "::error::expected 4 tarballs, found $count"; exit 1; }
+          [ "$count" = 2 ] || { echo "::error::expected 2 tarballs, found $count"; exit 1; }
           sha256sum -c checksums.txt
 
       # Package versions are read from the same nix/*.nix files the flake
-      # packages — each carries a literal `version = "X"` attr that nix eval
-      # would return verbatim. Fleet runners have no nix and no passwordless
-      # sudo, so grep is the dependency-free equivalent.
+      # packages — each carries a literal `version = "X"` attr. Grep keeps
+      # the publish job dependency-free (fleet runners have no nix).
       - name: release notes
         env:
           VERSION: ${{ needs.version.outputs.version }}
