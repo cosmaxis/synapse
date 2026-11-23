@@ -214,10 +214,9 @@ jobs:
       # fails with "Text file busy" trying to overwrite the binary. Stop it first.
       - name: stop running nix daemon
         run: |
-          if command -v nix >/dev/null 2>&1; then
-            sudo launchctl bootout system /Library/LaunchDaemons/org.nixos.nix-daemon.plist 2>/dev/null || true
-            sudo systemctl stop nix-daemon.socket nix-daemon.service 2>/dev/null || true
-          fi
+          sudo launchctl bootout system /Library/LaunchDaemons/org.nixos.nix-daemon.plist 2>/dev/null || true
+          sudo systemctl stop nix-daemon.socket nix-daemon.service 2>/dev/null || true
+          sudo pkill -f 'nix-daemon' 2>/dev/null || true
 
       - uses: cachix/install-nix-action@v27
         with:
@@ -316,10 +315,9 @@ jobs:
       # fails with "Text file busy" trying to overwrite the binary. Stop it first.
       - name: stop running nix daemon
         run: |
-          if command -v nix >/dev/null 2>&1; then
-            sudo launchctl bootout system /Library/LaunchDaemons/org.nixos.nix-daemon.plist 2>/dev/null || true
-            sudo systemctl stop nix-daemon.socket nix-daemon.service 2>/dev/null || true
-          fi
+          sudo launchctl bootout system /Library/LaunchDaemons/org.nixos.nix-daemon.plist 2>/dev/null || true
+          sudo systemctl stop nix-daemon.socket nix-daemon.service 2>/dev/null || true
+          sudo pkill -f 'nix-daemon' 2>/dev/null || true
 
       - uses: cachix/install-nix-action@v27
         with:
