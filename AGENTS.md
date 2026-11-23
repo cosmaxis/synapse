@@ -251,18 +251,26 @@ code, it is decoration — delete it.
 
 `.github/workflows/release.yml` triggers on `v*` tags. `version` gate fails the
 build if the tag disagrees with `Cargo.toml` — a mismatched tag would publish
-assets the installer cannot resolve. Then a 4-target native build matrix (no
-cross-compilation; each target has its own runner), then collect, checksum, and
-publish. `contents: write` is scoped to the release job only.
+assets the installer cannot resolve. All four build legs run on the
+self-hosted ARM64 fleet (`mac-server` labels); the two x86_64 targets
+cross-compile — `x86_64-apple-darwin` via `rustup target add` + clang on the
+macOS fleet, `x86_64-unknown-linux-gnu` via `cargo-zigbuild` (`.2.35` glibc
+baseline) on the Linux fleet. GitHub-hosted runners are deliberately unused:
+the hosted pool starved every release ~8h until auto-cancel (through v1.2.13).
+Then collect, checksum, and publish. `contents: write` is scoped to the
+release job only; release notes read managed-package versions by grepping the
+literal `version` attr in `nix/*.nix` (fleet runners have no nix/sudo).
 
 ---
 
 ## Release status
 
-**v1.1.0 and v1.2.0 are released.** v1.2.0 was tagged on 2026-09-15 and its
-release workflow published all four target assets; an anonymous aarch64-darwin
-bootstrap succeeded. Any work after that tag, including encrypted portable-secret
-sync, remains unreleased until it has its own CI, tag, assets, and bootstrap proof.
+**v1.2.14 is the current release** (tagged 2026-11-23): first fully
+self-hosted release — all four assets built on the fleet via cross-compile,
+published with checksums. Earlier tags ≤ v1.2.13 never published
+(hosted-runner starvation); the `v1.2.13` tag remains on the remote with no
+release. Encrypted portable-secret sync remains unreleased until it has its
+own CI, tag, assets, and bootstrap proof.
 
 ---
 
