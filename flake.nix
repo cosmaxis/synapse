@@ -49,9 +49,9 @@
           version = "1.2.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
-          # Nix build sandbox has no `which` binary; tests that probe
-          # `which <bin>` need it on PATH inside the sandbox.
-          nativeBuildInputs = [ pkgs.which ];
+          # Nix build sandbox has no `which` or `git`; tests that probe
+          # `which <bin>` or shell out to git need both on PATH inside the sandbox.
+          nativeBuildInputs = [ pkgs.which pkgs.git ];
           meta.mainProgram = "synapse";
         };
       in
