@@ -58,13 +58,10 @@ jobs:
 
   # ── Per-target build ───────────────────────────────────────────────────────
   #
-  # Fleet runners are ARM64-only, so x86_64 assets cannot be built natively
-  # there: `cargo build` only targets the host triple, the host-triple
-  # assertion below requires a real x86_64 rustc, and the flake's
-  # buildRustPackage has no pkgsCross setup for ARM64→x86_64. x86_64 matrix
-  # entries carry a hosted runs_on label and build on GitHub-hosted runners;
-  # the aarch64 entries stay on the fleet. All four release assets are still
-  # produced — nothing is dropped.
+  # All four legs run on the self-hosted ARM64 fleet; the two x86_64 targets
+  # cross-compile (macOS via rustup target + clang, Linux via cargo-zigbuild).
+  # GitHub-hosted runners are deliberately unused: the hosted pool starved
+  # every release for ~8h until GitHub auto-cancelled the queued jobs.
   build:
     name: build ${{ matrix.target }}
     needs: version
@@ -77,17 +74,19 @@ jobs:
             target: aarch64-apple-darwin
             runner: macOS
             runs_on: '{"group":"Default","labels":["self-hosted","macOS","ARM64","mac-server"]}'
-          - os: macos-15-intel
+          - os: macos-15
             target: x86_64-apple-darwin
             runner: macOS
-            runs_on: '"macos-15-intel"'
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            runner: Linux
-            runs_on: '"ubuntu-22.04"'
+            cross: true
+            runs_on: '{"group":"Default","labels":["self-hosted","macOS","ARM64","mac-server"]}'
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             runner: Linux
+            runs_on: '{"group":"Default","labels":["self-hosted","Linux","ARM64","mac-server"]}'
+          - os: ubuntu-22.04-arm
+            target: x86_64-unknown-linux-gnu
+            runner: Linux
+            cross: true
             runs_on: '{"group":"Default","labels":["self-hosted","Linux","ARM64","mac-server"]}'
     steps:
       - uses: actions/checkout@v4
@@ -98,17 +97,52 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      - name: runner host triple matches the asset triple
+      - name: runner host triple is aarch64 for this target's OS
         shell: bash
         run: |
           set -euo pipefail
           host="$(rustc -vV | sed -n 's/^host: //p')"
-          echo "rustc host: $host"
-          [ "$host" = "${{ matrix.target }}" ] \
-            || { echo "::error::runner ${{ matrix.runner }} is $host, not ${{ matrix.target }}"; exit 1; }
+          echo "rustc host: $host; target: ${{ matrix.target }}"
+          case "${{ matrix.target }}" in
+            *-apple-darwin|*-unknown-linux-*)
+              [ "${host%%-*}" = "aarch64" ] ;;
+            *) exit 1 ;;
+          esac
+
+      - name: zig + cargo-zigbuild for Linux x86_64 cross
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          # Fleet runners are persistent: this installs once, later runs skip.
+          command -v cargo-zigbuild >/dev/null \
+            || cargo install cargo-zigbuild --locked
+          if ! command -v zig >/dev/null; then
+            zig_json="$(curl -fsSL https://ziglang.org/download/index.json)"
+            zig_ver="$(printf '%s' "$zig_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["master"]["version"])')"
+            curl -fsSL "https://ziglang.org/download/${zig_ver}/zig-linux-aarch64-${zig_ver}.tar.xz" -o /tmp/zig.tar.xz
+            mkdir -p "$HOME/.local/zig"
+            tar -xJf /tmp/zig.tar.xz -C "$HOME/.local/zig" --strip-components=1
+            rm /tmp/zig.tar.xz
+            echo "$HOME/.local/zig" >> "$GITHUB_PATH"
+          fi
+          rustup target add x86_64-unknown-linux-gnu
+
+      - name: rust target for macOS x86_64 cross
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: rustup target add x86_64-apple-darwin
 
       - name: cargo build
-        run: cargo build --release --locked
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            # .2.35 keeps the glibc baseline identical to the old ubuntu-22.04
+            # hosted build; zig supplies the cross libc and linker.
+            cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.35
+          else
+            cargo build --release --locked --target "${{ matrix.target }}"
+          fi
 
       - name: package
         shell: bash
@@ -117,11 +151,20 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          # -x keeps the strip portable across GNU binutils and cctools.
-          strip -x target/release/synapse
+          # --target puts the binary under target/<triple>/release.
+          bin="$(find target -path '*/release/synapse' -type f | head -1)"
+          [ -n "$bin" ] || { echo "::error::synapse binary not found under target/"; exit 1; }
+          # llvm-strip handles foreign-arch binaries where binutils strip may not.
+          if command -v llvm-strip >/dev/null; then
+            strip_bin=llvm-strip
+          else
+            rustup component add llvm-tools >/dev/null
+            strip_bin="$(find "$(rustc --print sysroot)" -name llvm-strip -type f | head -1)"
+          fi
+          "${strip_bin:-strip}" -x "$bin"
           tarball="synapse-${VERSION}-${TARGET}.tar.gz"
           # -C means the archive holds exactly one member, `synapse`, at root.
-          tar -czf "$tarball" -C target/release synapse
+          tar -czf "$tarball" -C "$(dirname "$bin")" synapse
           tar -tzf "$tarball"
           ls -lh "$tarball"
           echo "TARBALL=$tarball" >> "$GITHUB_ENV"
