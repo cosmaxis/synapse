@@ -114,6 +114,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - name: macos-arm
+            os: macos-15
+            runner: macOS
+            runs_on: '{"group":"Default","labels":["self-hosted","macOS","ARM64","mac-server"]}'
           - name: linux-aarch64
             os: ubuntu-22.04-arm
             runner: Linux
