@@ -30,7 +30,7 @@ jobs:
       # reports the toolchain as installed; force a clean reinstall in that case.
       - name: repair corrupted rustup toolchain
         run: |
-          if ! rustc --version >/dev/null 2>&1; then
+          if ! rustc --version >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
             rustup toolchain uninstall stable 2>/dev/null || true
           fi
 
@@ -88,7 +88,7 @@ jobs:
       # reports the toolchain as installed; force a clean reinstall in that case.
       - name: repair corrupted rustup toolchain
         run: |
-          if ! rustc --version >/dev/null 2>&1; then
+          if ! rustc --version >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
             rustup toolchain uninstall stable 2>/dev/null || true
           fi
 
@@ -144,7 +144,7 @@ jobs:
       # reports the toolchain as installed; force a clean reinstall in that case.
       - name: repair corrupted rustup toolchain
         run: |
-          if ! rustc --version >/dev/null 2>&1; then
+          if ! rustc --version >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
             rustup toolchain uninstall stable 2>/dev/null || true
           fi
 
@@ -208,12 +208,7 @@ jobs:
       # installer abort before it can do anything useful.
       - name: clear stale nix installer state
         run: |
-          sudo rm -f /etc/bash.bashrc.backup-before-nix \
-                     /etc/bashrc.backup-before-nix \
-                     /etc/profile.backup-before-nix \
-                     /etc/zshrc.backup-before-nix \
-                     /etc/zprofile.backup-before-nix \
-                     /etc/zshenv.backup-before-nix
+          sudo find /etc -name '*.backup-before-nix' -delete 2>/dev/null || true
 
       - uses: cachix/install-nix-action@v27
         with:
@@ -299,7 +294,7 @@ jobs:
       # reports the toolchain as installed; force a clean reinstall in that case.
       - name: repair corrupted rustup toolchain
         run: |
-          if ! rustc --version >/dev/null 2>&1; then
+          if ! rustc --version >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
             rustup toolchain uninstall stable 2>/dev/null || true
           fi
 
@@ -403,7 +398,7 @@ jobs:
       # reports the toolchain as installed; force a clean reinstall in that case.
       - name: repair corrupted rustup toolchain
         run: |
-          if ! rustc --version >/dev/null 2>&1; then
+          if ! rustc --version >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
             rustup toolchain uninstall stable 2>/dev/null || true
           fi
 
