@@ -59,14 +59,15 @@ trap 'cleanup; exit 143' TERM
 # ── Detect platform ─────────────────────────────────────────────────────────
 # Windows is supported through WSL2, which reports itself as Linux, so the
 # Darwin/Linux pair covers the whole v1 platform matrix.
-SUPPORTED="macOS (Intel, Apple Silicon), Linux (x86_64, aarch64), Windows via WSL2"
+SUPPORTED="macOS (Apple Silicon), Linux (aarch64), Windows via WSL2"
 
 UNAME_S="$(uname -s)"
 UNAME_M="$(uname -m)"
 
 case "$UNAME_M" in
   arm64 | aarch64)  ARCH='aarch64' ;;
-  x86_64 | amd64)   ARCH='x86_64' ;;
+  x86_64 | amd64)   die "Intel/amd64 is no longer supported." \
+                        "Synapse supports: $SUPPORTED" ;;
   *) die "Unsupported CPU architecture: $UNAME_M" \
          "Synapse supports: $SUPPORTED" ;;
 esac

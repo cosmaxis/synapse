@@ -73,7 +73,7 @@ no_staging_files() { # destination dir must hold no .synapse.* leftovers
 # Derived here independently of install.sh, so the two can disagree.
 case "$(uname -m)" in
   arm64 | aarch64) arch='aarch64' ;;
-  x86_64 | amd64)  arch='x86_64' ;;
+  x86_64 | amd64)  note "::error::x86_64 is no longer supported"; exit 1 ;;
   *) note "::error::unsupported arch for this test: $(uname -m)"; exit 1 ;;
 esac
 case "$(uname -s)" in
@@ -85,15 +85,14 @@ EXPECT_STUB="synapse 9.9.9 (stub $EXPECT_TARGET)"
 echo "== fake release for $EXPECT_TARGET"
 
 # --- build the fake release ------------------------------------------------
-# All four targets get an asset, so picking the right one is a real choice and
-# not the only option on offer. Each stub names its own target, so a wrong pick
-# is visible in the installed binary's output rather than passing silently.
+# Both shipped targets get an asset. Each stub names its own target, so a
+# wrong pick is visible in the installed binary's output rather than passing
+# silently.
 RELEASE="$WORK/release"
 STAGE="$WORK/stage"
 mkdir -p "$RELEASE" "$STAGE"
 
-for t in aarch64-apple-darwin x86_64-apple-darwin \
-         x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+for t in aarch64-apple-darwin aarch64-unknown-linux-gnu; do
   cat > "$STAGE/synapse" <<EOF
 #!/bin/sh
 [ "\${1:-}" = version ] && { echo 'synapse 9.9.9 (stub $t)'; exit 0; }
