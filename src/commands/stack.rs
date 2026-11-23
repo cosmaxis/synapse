@@ -1672,12 +1672,16 @@ fn record_bootstrap(repo: &Path) {
 
 /// True when HEAD is still the bootstrap commit. Primary signal is the
 /// refs/synapse/bootstrap ref recorded at init. Repos bootstrapped before
-/// the ref existed fall back to structure plus the identity `skillshare
-/// init` pins in the repo's local git config (user.name=skillshare,
-/// user.email=skillshare@local) — a user's own .gitignore-only commit
-/// carries neither, so it is preserved. Residual risk: a user who copied
-/// that identity into their own repo could still match; acceptable for
-/// the shrinking pre-ref population.
+/// the ref existed fall back to structure alone: a single root commit whose
+/// tree holds only .gitignore is the `skillshare init --git` scaffold shape
+/// across every version that supports --git-root (v0.20.0+). Identity cannot
+/// discriminate — skillshare pins user.name/email locally only when no
+/// identity is configured anywhere, so users with a global git identity
+/// (the common case) produce scaffold commits with no local pin. Residual
+/// risk: a user's own repo whose entire history is one .gitignore-only
+/// commit inside a skillshare-configured source with a matching origin
+/// would also realign; that repo holds no user data beyond the ignore
+/// rules, and the displaced commit stays recoverable via reflog.
 fn is_scaffold_head(repo: &Path) -> bool {
     if let Some(recorded) = git_output(repo, &["rev-parse", BOOTSTRAP_REF]) {
         return git_output(repo, &["rev-parse", "HEAD"])
@@ -1689,11 +1693,7 @@ fn is_scaffold_head(repo: &Path) -> bool {
         .is_some_and(|roots| !roots.is_empty());
     let tree = git_output(repo, &["ls-tree", "-r", "--name-only", "HEAD"])
         .is_some_and(|files| files == ".gitignore");
-    let skillshare_identity = git_output(repo, &["config", "--local", "user.name"])
-        .is_some_and(|name| name.trim() == "skillshare")
-        && git_output(repo, &["config", "--local", "user.email"])
-            .is_some_and(|email| email.trim() == "skillshare@local");
-    single && root && tree && skillshare_identity
+    single && root && tree
 }
 
 fn git_run(repo: &Path, args: &[&str]) -> io::Result<()> {
@@ -5049,9 +5049,9 @@ mod tests {
         let remote_str = remote.to_string_lossy().into_owned();
         git(&remote_work, &["push", remote_str.as_str(), "HEAD:main"]);
 
-        // Pre-ref bootstrap shape: single root commit, tree holds only
-        // .gitignore, NO refs/synapse/bootstrap, and no skillshare local
-        // identity. The structural fallback must not realign this.
+        // Established user history: two commits, HEAD tree holds real work
+        // alongside .gitignore. No refs/synapse/bootstrap. The structural
+        // fallback must not realign this.
         fs::create_dir_all(&config).unwrap();
         fs::write(config.join("config.yaml"), "git_root: root\n").unwrap();
         Command::new("git")
@@ -5062,18 +5062,21 @@ mod tests {
         fs::write(local.join(".gitignore"), "config.yaml\nuser rules\n").unwrap();
         git(&local, &["add", "-A"]);
         git(&local, &["commit", "-qm", "my ignore rules"]);
+        fs::write(local.join("notes.txt"), "user work\n").unwrap();
+        git(&local, &["add", "-A"]);
+        git(&local, &["commit", "-qm", "user work"]);
         let local_head = git(&local, &["rev-parse", "HEAD"]);
 
         ensure_skillshare_repository(&remote_str, "root").unwrap();
         assert_eq!(
             git(&local, &["rev-parse", "HEAD"]),
             local_head,
-            "no-ref .gitignore-only commit without skillshare identity must not reset"
+            "established history without bootstrap ref must not reset"
         );
         assert_eq!(
-            git(&local, &["show", "HEAD:.gitignore"]),
-            "config.yaml\nuser rules",
-            "committed .gitignore content must survive"
+            git(&local, &["show", "HEAD:notes.txt"]),
+            "user work",
+            "user commit content must survive"
         );
 
         fs::remove_dir_all(temp).ok();
