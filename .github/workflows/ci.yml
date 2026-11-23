@@ -30,9 +30,14 @@ jobs:
       # reports the toolchain as installed; force a clean reinstall in that case.
       - name: repair corrupted rustup toolchain
         run: |
-          if ! rustc --version >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
-            rustup toolchain uninstall stable 2>/dev/null || true
-          fi
+          # rustup can report a toolchain as installed while individual
+          # binaries (rustc, cargo) are missing from its bin dir. Check the
+          # actual files rather than relying on rustup's metadata.
+          found=false
+          for d in "$HOME"/.rustup/toolchains/stable-*/bin; do
+            [ -x "$d/rustc" ] && [ -x "$d/cargo" ] && found=true && break
+          done
+          [ "$found" = true ] || rustup toolchain uninstall stable 2>/dev/null || true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -88,9 +93,14 @@ jobs:
       # reports the toolchain as installed; force a clean reinstall in that case.
       - name: repair corrupted rustup toolchain
         run: |
-          if ! rustc --version >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
-            rustup toolchain uninstall stable 2>/dev/null || true
-          fi
+          # rustup can report a toolchain as installed while individual
+          # binaries (rustc, cargo) are missing from its bin dir. Check the
+          # actual files rather than relying on rustup's metadata.
+          found=false
+          for d in "$HOME"/.rustup/toolchains/stable-*/bin; do
+            [ -x "$d/rustc" ] && [ -x "$d/cargo" ] && found=true && break
+          done
+          [ "$found" = true ] || rustup toolchain uninstall stable 2>/dev/null || true
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -144,9 +154,14 @@ jobs:
       # reports the toolchain as installed; force a clean reinstall in that case.
       - name: repair corrupted rustup toolchain
         run: |
-          if ! rustc --version >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
-            rustup toolchain uninstall stable 2>/dev/null || true
-          fi
+          # rustup can report a toolchain as installed while individual
+          # binaries (rustc, cargo) are missing from its bin dir. Check the
+          # actual files rather than relying on rustup's metadata.
+          found=false
+          for d in "$HOME"/.rustup/toolchains/stable-*/bin; do
+            [ -x "$d/rustc" ] && [ -x "$d/cargo" ] && found=true && break
+          done
+          [ "$found" = true ] || rustup toolchain uninstall stable 2>/dev/null || true
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -302,9 +317,14 @@ jobs:
       # reports the toolchain as installed; force a clean reinstall in that case.
       - name: repair corrupted rustup toolchain
         run: |
-          if ! rustc --version >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
-            rustup toolchain uninstall stable 2>/dev/null || true
-          fi
+          # rustup can report a toolchain as installed while individual
+          # binaries (rustc, cargo) are missing from its bin dir. Check the
+          # actual files rather than relying on rustup's metadata.
+          found=false
+          for d in "$HOME"/.rustup/toolchains/stable-*/bin; do
+            [ -x "$d/rustc" ] && [ -x "$d/cargo" ] && found=true && break
+          done
+          [ "$found" = true ] || rustup toolchain uninstall stable 2>/dev/null || true
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -414,9 +434,14 @@ jobs:
       # reports the toolchain as installed; force a clean reinstall in that case.
       - name: repair corrupted rustup toolchain
         run: |
-          if ! rustc --version >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
-            rustup toolchain uninstall stable 2>/dev/null || true
-          fi
+          # rustup can report a toolchain as installed while individual
+          # binaries (rustc, cargo) are missing from its bin dir. Check the
+          # actual files rather than relying on rustup's metadata.
+          found=false
+          for d in "$HOME"/.rustup/toolchains/stable-*/bin; do
+            [ -x "$d/rustc" ] && [ -x "$d/cargo" ] && found=true && break
+          done
+          [ "$found" = true ] || rustup toolchain uninstall stable 2>/dev/null || true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
