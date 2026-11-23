@@ -52,31 +52,22 @@ jobs:
         run: ./ci/check-nix-version.sh --self-test
 
   # ── Rust build + tests across every supported platform ────────────────────
+  #
+  # x86_64 support was dropped: all legs run native on the self-hosted ARM64
+  # fleet. GitHub-hosted runners are deliberately unused — the hosted pool
+  # starved every CI run for ~8h until auto-cancel.
   test:
     name: test ${{ matrix.name }}
-    # Fleet runners are ARM64-only. Legs that need a native x86_64 toolchain
-    # or runner (arch assertions, Intel macOS) carry a hosted runs_on label;
-    # everything else carries the fleet group/labels. fromJSON picks the type.
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: macos-intel-x86_64
-            os: macos-15-intel
-            runner: macOS
-            arch: x86_64
-            runs_on: '"macos-15-intel"'
           - name: macos-arm-aarch64
             os: macos-15
             runner: macOS
             arch: aarch64
             runs_on: '{"group":"Default","labels":["self-hosted","macOS","ARM64","mac-server"]}'
-          - name: linux-x86_64
-            os: ubuntu-22.04
-            runner: Linux
-            arch: x86_64
-            runs_on: '"ubuntu-22.04"'
           - name: linux-aarch64
             os: ubuntu-22.04-arm
             runner: Linux
@@ -123,14 +114,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: macos-arm
-            os: macos-15
-            runner: macOS
-            runs_on: '{"group":"Default","labels":["self-hosted","macOS","ARM64","mac-server"]}'
-          - name: linux-x86_64
-            os: ubuntu-22.04
+          - name: linux-aarch64
+            os: ubuntu-22.04-arm
             runner: Linux
-            runs_on: '"ubuntu-22.04"'
+            runs_on: '{"group":"Default","labels":["self-hosted","Linux","ARM64","mac-server"]}'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -166,8 +153,8 @@ jobs:
 
   # ── Nix flake: build every claimed target natively ─────────────────────────
   #
-  # x86_64-darwin resolves through the maintained 26.05 Darwin nixpkgs branch;
-  # the other targets follow nixos-unstable.
+  # x86_64 support was dropped (see test matrix); only the two native
+  # aarch64 systems remain, both on nixos-unstable.
   nix-flake:
     name: nix ${{ matrix.nix_system }}
     runs-on: ${{ fromJSON(matrix.runs_on) }}
@@ -175,18 +162,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-15-intel
-            nix_system: x86_64-darwin
-            runner: macOS
-            runs_on: '"macos-15-intel"'
           - os: macos-15
             nix_system: aarch64-darwin
             runner: macOS
             runs_on: '{"group":"Default","labels":["self-hosted","macOS","ARM64","mac-server"]}'
-          - os: ubuntu-22.04
-            nix_system: x86_64-linux
-            runner: Linux
-            runs_on: '"ubuntu-22.04"'
           - os: ubuntu-22.04-arm
             nix_system: aarch64-linux
             runner: Linux
@@ -245,10 +224,7 @@ jobs:
             ./result-harness/bin/"$bin" --version
           done
 
-      # x86_64-darwin uses the maintained 26.05 branch, which does not ship
-      # nix-fast-build. The separate package builds above remain the proof.
       - name: parallel build via nix-fast-build
-        if: matrix.nix_system != 'x86_64-darwin'
         run: |
           set -euo pipefail
           # Everything is already in the local store, so this exercises the
@@ -271,10 +247,10 @@ jobs:
             nix_system: aarch64-darwin
             runner: macOS
             runs_on: '{"group":"Default","labels":["self-hosted","macOS","ARM64","mac-server"]}'
-          - os: ubuntu-22.04
-            nix_system: x86_64-linux
+          - os: ubuntu-22.04-arm
+            nix_system: aarch64-linux
             runner: Linux
-            runs_on: '"ubuntu-22.04"'
+            runs_on: '{"group":"Default","labels":["self-hosted","Linux","ARM64","mac-server"]}'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
