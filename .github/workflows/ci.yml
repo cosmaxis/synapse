@@ -179,10 +179,9 @@ jobs:
             sudo apt-get update -qq
             sudo apt-get install -y -qq zsh fish
           else
-            # macOS runners ship zsh; fish comes from brew. The actions-runner
-            # service PATH lacks /opt/homebrew/bin, so resolve brew explicitly.
-            export PATH="/opt/homebrew/bin:$PATH"
-            command -v fish >/dev/null || brew install fish
+            # macOS fleet runners have no brew or nix; fish is only tested on
+            # Linux where apt provides it. zsh ships with macOS.
+            true
           fi
 
       # Proves the generated rc is valid syntax, actually sets PATH, loads
@@ -194,6 +193,7 @@ jobs:
         run: ./ci/shell-check.sh zsh "${{ runner.temp }}/home-zsh"
 
       - name: fish integration
+        if: matrix.runner == 'Linux'
         run: ./ci/shell-check.sh fish "${{ runner.temp }}/home-fish"
 
   # ── Nix flake: build every claimed target natively ─────────────────────────
