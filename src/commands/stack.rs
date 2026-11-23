@@ -1670,11 +1670,14 @@ fn record_bootstrap(repo: &Path) {
     }
 }
 
-/// True when HEAD is still the recorded bootstrap commit. Falls back to a
-/// structural check for repos bootstrapped before the ref existed: a single
-/// root commit whose tree holds only .gitignore. The fallback can match a
-/// user's own .gitignore-only commit, but only for repos that predate the
-/// ref — new bootstraps always carry it.
+/// True when HEAD is still the bootstrap commit. Primary signal is the
+/// refs/synapse/bootstrap ref recorded at init. Repos bootstrapped before
+/// the ref existed fall back to structure plus the identity `skillshare
+/// init` pins in the repo's local git config (user.name=skillshare,
+/// user.email=skillshare@local) — a user's own .gitignore-only commit
+/// carries neither, so it is preserved. Residual risk: a user who copied
+/// that identity into their own repo could still match; acceptable for
+/// the shrinking pre-ref population.
 fn is_scaffold_head(repo: &Path) -> bool {
     if let Some(recorded) = git_output(repo, &["rev-parse", BOOTSTRAP_REF]) {
         return git_output(repo, &["rev-parse", "HEAD"])
@@ -1684,10 +1687,13 @@ fn is_scaffold_head(repo: &Path) -> bool {
         git_output(repo, &["rev-list", "--count", "HEAD"]).is_some_and(|count| count.trim() == "1");
     let root = git_output(repo, &["rev-list", "--max-parents=0", "HEAD"])
         .is_some_and(|roots| !roots.is_empty());
-    single
-        && root
-        && git_output(repo, &["ls-tree", "-r", "--name-only", "HEAD"])
-            .is_some_and(|files| files == ".gitignore")
+    let tree = git_output(repo, &["ls-tree", "-r", "--name-only", "HEAD"])
+        .is_some_and(|files| files == ".gitignore");
+    let skillshare_identity = git_output(repo, &["config", "--local", "user.name"])
+        .is_some_and(|name| name.trim() == "skillshare")
+        && git_output(repo, &["config", "--local", "user.email"])
+            .is_some_and(|email| email.trim() == "skillshare@local");
+    single && root && tree && skillshare_identity
 }
 
 fn git_run(repo: &Path, args: &[&str]) -> io::Result<()> {
@@ -4622,6 +4628,99 @@ mod tests {
     }
 
     #[test]
+    fn ensure_skillshare_repository_aligns_pre_ref_scaffold() {
+        let _lock = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tmpdir("skillshare-pre-ref-align");
+        let config = temp.join("xdg").join("skillshare");
+        let local = config.clone();
+        let _git_bin = EnvGuard::set("SYNAPSE_GIT_BIN", Path::new("git"));
+        let _config_env = EnvGuard::set("SYNAPSE_SKILLSHARE_CONFIG", &config.join("config.yaml"));
+        let _author = EnvGuard::set_text("GIT_AUTHOR_NAME", "synapse-test");
+        let _aemail = EnvGuard::set_text("GIT_AUTHOR_EMAIL", "test@localhost");
+        let _cname = EnvGuard::set_text("GIT_COMMITTER_NAME", "synapse-test");
+        let _cemail = EnvGuard::set_text("GIT_COMMITTER_EMAIL", "test@localhost");
+
+        let git = |dir: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+
+        // Remote carries the captured stack.
+        let remote_work = temp.join("remote-work");
+        let remote = temp.join("remote.git");
+        fs::create_dir_all(remote_work.join(".synapse/stack")).unwrap();
+        fs::write(
+            remote_work.join(".synapse/stack/stack.json"),
+            "{\"version\":1}",
+        )
+        .unwrap();
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&remote_work)
+            .output()
+            .unwrap();
+        git(&remote_work, &["add", "-A"]);
+        git(&remote_work, &["commit", "-qm", "stack export"]);
+        let remote_str = remote.to_string_lossy().into_owned();
+        git(&remote_work, &["push", remote_str.as_str(), "HEAD:main"]);
+
+        // Pre-ref scaffold: `skillshare init` pins user.name/email in the
+        // repo's local git config; HEAD is the single .gitignore commit;
+        // no refs/synapse/bootstrap exists. The fallback must realign.
+        fs::create_dir_all(&config).unwrap();
+        fs::write(config.join("config.yaml"), "git_root: root\n").unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&local)
+            .output()
+            .unwrap();
+        fs::write(local.join(".gitignore"), "config.yaml\n.DS_Store\n").unwrap();
+        git(&local, &["add", "-A"]);
+        git(&local, &["commit", "-qm", "Initial skills"]);
+        git(&local, &["config", "user.name", "skillshare"]);
+        git(&local, &["config", "user.email", "skillshare@local"]);
+        fs::write(local.join("config.yaml"), "git_root: root\n").unwrap();
+
+        ensure_skillshare_repository(&remote_str, "root").unwrap();
+
+        let ancestor = Command::new("git")
+            .arg("-C")
+            .arg(&local)
+            .args(["merge-base", "--is-ancestor", "origin/main", "HEAD"])
+            .status()
+            .unwrap();
+        assert!(
+            ancestor.success(),
+            "pre-ref scaffold must realign onto origin/main"
+        );
+        assert_eq!(
+            git(&local, &["rev-parse", "--abbrev-ref", "@{u}"]),
+            "origin/main"
+        );
+        assert!(local.join(".synapse/stack/stack.json").is_file());
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
     fn ensure_skillshare_repository_preserves_unrelated_local_history() {
         let _lock = crate::test_utils::XDG_ENV_LOCK
             .lock()
@@ -4885,6 +4984,91 @@ mod tests {
             git(&local, &["rev-parse", "HEAD"]),
             local_head,
             "user .gitignore-only commit must not be reset onto the remote"
+        );
+        assert_eq!(
+            git(&local, &["show", "HEAD:.gitignore"]),
+            "config.yaml\nuser rules",
+            "committed .gitignore content must survive"
+        );
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn ensure_skillshare_repository_preserves_gitignore_only_without_bootstrap_ref() {
+        let _lock = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tmpdir("skillshare-gitignore-no-ref");
+        let config = temp.join("xdg").join("skillshare");
+        let local = config.clone();
+        let _git_bin = EnvGuard::set("SYNAPSE_GIT_BIN", Path::new("git"));
+        let _config_env = EnvGuard::set("SYNAPSE_SKILLSHARE_CONFIG", &config.join("config.yaml"));
+        let _author = EnvGuard::set_text("GIT_AUTHOR_NAME", "synapse-test");
+        let _aemail = EnvGuard::set_text("GIT_AUTHOR_EMAIL", "test@localhost");
+        let _cname = EnvGuard::set_text("GIT_COMMITTER_NAME", "synapse-test");
+        let _cemail = EnvGuard::set_text("GIT_COMMITTER_EMAIL", "test@localhost");
+
+        let git = |dir: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+
+        // Remote carries the captured stack.
+        let remote_work = temp.join("remote-work");
+        let remote = temp.join("remote.git");
+        fs::create_dir_all(remote_work.join(".synapse/stack")).unwrap();
+        fs::write(
+            remote_work.join(".synapse/stack/stack.json"),
+            "{\"version\":1}",
+        )
+        .unwrap();
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&remote_work)
+            .output()
+            .unwrap();
+        git(&remote_work, &["add", "-A"]);
+        git(&remote_work, &["commit", "-qm", "stack export"]);
+        let remote_str = remote.to_string_lossy().into_owned();
+        git(&remote_work, &["push", remote_str.as_str(), "HEAD:main"]);
+
+        // Pre-ref bootstrap shape: single root commit, tree holds only
+        // .gitignore, NO refs/synapse/bootstrap, and no skillshare local
+        // identity. The structural fallback must not realign this.
+        fs::create_dir_all(&config).unwrap();
+        fs::write(config.join("config.yaml"), "git_root: root\n").unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&local)
+            .output()
+            .unwrap();
+        fs::write(local.join(".gitignore"), "config.yaml\nuser rules\n").unwrap();
+        git(&local, &["add", "-A"]);
+        git(&local, &["commit", "-qm", "my ignore rules"]);
+        let local_head = git(&local, &["rev-parse", "HEAD"]);
+
+        ensure_skillshare_repository(&remote_str, "root").unwrap();
+        assert_eq!(
+            git(&local, &["rev-parse", "HEAD"]),
+            local_head,
+            "no-ref .gitignore-only commit without skillshare identity must not reset"
         );
         assert_eq!(
             git(&local, &["show", "HEAD:.gitignore"]),
