@@ -26,6 +26,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Fleet runners occasionally lose the rustc binary while rustup still
+      # reports the toolchain as installed; force a clean reinstall in that case.
+      - name: repair corrupted rustup toolchain
+        run: |
+          if ! rustc --version >/dev/null 2>&1; then
+            rustup toolchain uninstall stable 2>/dev/null || true
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -76,6 +84,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Fleet runners occasionally lose the rustc binary while rustup still
+      # reports the toolchain as installed; force a clean reinstall in that case.
+      - name: repair corrupted rustup toolchain
+        run: |
+          if ! rustc --version >/dev/null 2>&1; then
+            rustup toolchain uninstall stable 2>/dev/null || true
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -124,6 +140,14 @@ jobs:
             runs_on: '{"group":"Default","labels":["self-hosted","Linux","ARM64","mac-server"]}'
     steps:
       - uses: actions/checkout@v4
+      # Fleet runners occasionally lose the rustc binary while rustup still
+      # reports the toolchain as installed; force a clean reinstall in that case.
+      - name: repair corrupted rustup toolchain
+        run: |
+          if ! rustc --version >/dev/null 2>&1; then
+            rustup toolchain uninstall stable 2>/dev/null || true
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -271,6 +295,14 @@ jobs:
             runs_on: '{"group":"Default","labels":["self-hosted","Linux","ARM64","mac-server"]}'
     steps:
       - uses: actions/checkout@v4
+      # Fleet runners occasionally lose the rustc binary while rustup still
+      # reports the toolchain as installed; force a clean reinstall in that case.
+      - name: repair corrupted rustup toolchain
+        run: |
+          if ! rustc --version >/dev/null 2>&1; then
+            rustup toolchain uninstall stable 2>/dev/null || true
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -367,6 +399,14 @@ jobs:
         - mac-server
     steps:
       - uses: actions/checkout@v4
+      # Fleet runners occasionally lose the rustc binary while rustup still
+      # reports the toolchain as installed; force a clean reinstall in that case.
+      - name: repair corrupted rustup toolchain
+        run: |
+          if ! rustc --version >/dev/null 2>&1; then
+            rustup toolchain uninstall stable 2>/dev/null || true
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
